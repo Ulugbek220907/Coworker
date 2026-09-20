@@ -47,6 +47,7 @@ class AgentWindow:
         self.tray = tray_mod.Tray(lambda: None, lambda: None)
         self.has_tray = False
         self._told_about_tray = False
+        self._caps_chat: int | None = None   # which chat the checkboxes show
 
         self.root = tk.Tk()
         self.root.title("Coworker")
@@ -166,7 +167,10 @@ class AgentWindow:
     def _on_chat_select(self, _event=None) -> None:
         chat_id = self._selected_chat()
         widgets = [w for w in self.caps_frame.winfo_children() if isinstance(w, tk.Checkbutton)]
+        self._caps_chat = chat_id
         if chat_id is None:
+            for cap, var in self.cap_vars.items():
+                var.set(False)
             for w in widgets:
                 w.configure(state="disabled")
             self.caps_hint.configure(text="Telefonni tanlang")
@@ -183,6 +187,13 @@ class AgentWindow:
     def _toggle_cap(self, _cap: str) -> None:
         chat_id = self._selected_chat()
         if chat_id is None:
+            return
+        if chat_id != self._caps_chat:
+            # The checkboxes still show a different chat's capabilities.
+            # Writing them now would silently widen the wrong phone's
+            # access - resync and make the user tick again.
+            self._on_chat_select()
+            self._log("Telefon almashdi — ruxsatlarni qaytadan belgilang.")
             return
         chosen = [c for c, v in self.cap_vars.items() if v.get()]
         self.cfg.set_caps(chat_id, chosen)
