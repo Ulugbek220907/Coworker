@@ -46,6 +46,10 @@ app = FastAPI(title="Coworker Relay", docs_url=None, redoc_url=None)
 registry = Registry()
 tg = Telegram(BOT_TOKEN) if BOT_TOKEN else None
 
+# Surfaced on /healthz so a misregistered webhook is visible from outside
+# instead of looking like a healthy but silent bot.
+webhook_state: dict[str, object] = {"url": "", "ok": False, "error": "starting"}
+
 HELP = (
     "\U0001f916 Coworker\n\n"
     "Men sizning kompyuteringizdagi hujjatlarni topib beraman.\n\n"
@@ -71,12 +75,53 @@ async def _startup() -> None:
     if me.get("ok"):
         log.info("bot ready: @%s", me["result"].get("username"))
     await tg.set_commands()
-    if PUBLIC_URL:
-        url = f"{PUBLIC_URL}/tg"
-        res = await tg.set_webhook(url, WEBHOOK_SECRET)
-        log.info("webhook -> %s : %s", url, res.get("ok"))
-    else:
-        log.warning("no PUBLIC_URL/RENDER_EXTERNAL_URL - set the webhook manually")
+    # Registration runs in the background: Telegram validates the URL the
+    # moment setWebhook is called, and on a cold Render deploy the service is
+    # not publicly routable yet. One attempt at startup loses that race.
+    asyncio.create_task(_webhook_keeper())
+
+
+async def _webhook_keeper() -> None:
+    """Register the webhook, retry until it sticks, then keep verifying it."""
+    if not tg:
+        return
+    if not PUBLIC_URL:
+        webhook_state["error"] = "RENDER_EXTERNAL_URL/PUBLIC_URL is not set"
+        log.error("no public URL - cannot register a webhook")
+        return
+
+    want = f"{PUBLIC_URL}/tg"
+    delay = 5.0
+    while True:
+        try:
+            info = await tg.call("getWebhookInfo")
+            current = (info.get("result") or {}).get("url", "")
+
+            if current == want:
+                webhook_state.update({"url": current, "ok": True, "error": ""})
+                # Re-check occasionally; a redeploy or an outside call can
+                # clear it, and a silently unregistered bot looks "online".
+                await asyncio.sleep(600)
+                delay = 5.0
+                continue
+
+            res = await tg.set_webhook(want, WEBHOOK_SECRET)
+            if res.get("ok"):
+                webhook_state.update({"url": want, "ok": True, "error": ""})
+                log.info("webhook registered -> %s", want)
+                await asyncio.sleep(600)
+                delay = 5.0
+                continue
+
+            webhook_state.update({"ok": False, "error": str(res.get("description"))})
+            log.warning("setWebhook failed (%s) - retrying in %.0fs",
+                        res.get("description"), delay)
+        except Exception as exc:
+            webhook_state.update({"ok": False, "error": str(exc)[:200]})
+            log.warning("webhook check failed: %s - retrying in %.0fs", exc, delay)
+
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 120.0)
 
 
 @app.on_event("shutdown")
@@ -95,7 +140,30 @@ async def root() -> str:
 @app.get("/healthz")
 async def healthz() -> JSONResponse:
     # The agent pings this so Render's free tier does not spin the service down.
-    return JSONResponse({"ok": True, "agents": registry.snapshot(), "ts": int(time.time())})
+    return JSONResponse({
+        "ok": True,
+        "agents": registry.snapshot(),
+        "webhook": webhook_state,
+        "ts": int(time.time()),
+    })
+
+
+@app.get("/setup")
+async def setup(key: str = "") -> JSONResponse:
+    """Force webhook registration now. Guarded by the webhook secret."""
+    if not tg:
+        raise HTTPException(503, "bot disabled")
+    if not WEBHOOK_SECRET or key != WEBHOOK_SECRET:
+        raise HTTPException(403, "bad key")
+    if not PUBLIC_URL:
+        raise HTTPException(500, "PUBLIC_URL is not set")
+    res = await tg.set_webhook(f"{PUBLIC_URL}/tg", WEBHOOK_SECRET)
+    webhook_state.update({
+        "url": f"{PUBLIC_URL}/tg" if res.get("ok") else "",
+        "ok": bool(res.get("ok")),
+        "error": str(res.get("description") or ""),
+    })
+    return JSONResponse({"ok": bool(res.get("ok")), "detail": res.get("description")})
 
 
 # -------------------------------------------------------------- agent socket
