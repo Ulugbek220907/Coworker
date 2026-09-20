@@ -29,12 +29,70 @@ SKIP_DIRS = {
     "dist-packages", ".idea", ".vscode", "steamapps", "$windows.~bt",
 }
 
-# Extensions worth showing a human looking for "a document".
+# Extensions worth scanning for when SEARCHING. A directory listing does not
+# use this - "what is on my Desktop" must answer with what is actually there.
 DOC_EXT = SUPPORTED | {
     ".doc", ".xls", ".ppt", ".odt", ".ods", ".odp", ".pages", ".numbers",
     ".jpg", ".jpeg", ".png", ".heic", ".tif", ".tiff",  # scans count
     ".zip", ".rar", ".7z",
+    # A real Desktop is mostly shortcuts. Leaving these out made 15 of 19
+    # files on the user's own Desktop invisible, including the ones they
+    # asked for by name.
+    ".lnk", ".url", ".appref-ms",
 }
+
+# Never worth showing anyone.
+HIDE_ALWAYS = {".tmp", ".crdownload", ".part", ".lock"}
+HIDE_NAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
+
+# Windows knows where these live, including when OneDrive has moved them.
+# Guessing "C:\\Users\\<name>\\Desktop" is wrong on exactly the machines this
+# project targets - the user's own Desktop is under OneDrive.
+_KNOWN_FOLDER_GUIDS = {
+    "Desktop": "B4BFCC3A-DB2C-424C-B029-7FE99A87C641",
+    "Documents": "FDD39AD0-238F-46AF-ADB4-6C85480369C7",
+    "Downloads": "374DE290-123F-4565-9164-39C4925E467B",
+    "Pictures": "33E28130-4E1E-4676-835A-98395C3BC3BB",
+    "Music": "4BD8D571-6D19-48D3-BE97-422220080E43",
+    "Videos": "18989B1D-99B5-455B-841C-AB7C74E4DDFC",
+}
+
+
+# What people here actually call these folders. Windows reports them in
+# English even on a Russian install, so "ish stoli" or "рабочий стол" would
+# otherwise find nothing.
+FOLDER_ALIASES = {
+    "Desktop": ("ish stoli", "ishstoli", "rabochiy stol", "рабочий стол", "stol"),
+    "Documents": ("hujjatlar", "hujjat", "dokumenti", "документы", "mening hujjatlarim"),
+    "Downloads": ("yuklab olingan", "yuklamalar", "zagruzki", "загрузки", "yuklangan"),
+    "Pictures": ("rasmlar", "rasm", "suratlar", "izobrajeniya", "изображения", "foto"),
+    "Music": ("musiqa", "muzika", "музыка"),
+    "Videos": ("video", "videolar", "видео"),
+}
+
+
+def known_folders() -> dict[str, str]:
+    """{"Desktop": "C:/Users/.../OneDrive/Desktop", ...} - only ones that exist."""
+    if os.name != "nt":
+        home = Path.home()
+        return {n: str(home / n) for n in ("Desktop", "Documents", "Downloads")
+                if (home / n).is_dir()}
+
+    import ctypes
+    import uuid
+
+    out: dict[str, str] = {}
+    for name, guid in _KNOWN_FOLDER_GUIDS.items():
+        try:
+            buf = ctypes.c_wchar_p()
+            raw = ctypes.create_string_buffer(uuid.UUID(guid).bytes_le)
+            if ctypes.windll.shell32.SHGetKnownFolderPath(
+                ctypes.byref(raw), 0, None, ctypes.byref(buf)
+            ) == 0 and buf.value and os.path.isdir(buf.value):
+                out[name] = buf.value
+        except Exception:
+            continue
+    return out
 
 DEFAULT_DEADLINE = 8.0
 MAX_DEPTH = 7
@@ -128,8 +186,12 @@ def list_dir(path: str, limit: int = 60) -> dict:
                             continue
                         dirs.append({"path": entry.path, "name": entry.name})
                     elif entry.is_file(follow_symlinks=False):
+                        # A listing answers "what is in this folder", so it
+                        # shows what is there. Filtering to document types
+                        # here is how a Desktop of shortcuts came back looking
+                        # almost empty.
                         ext = os.path.splitext(entry.name)[1].lower()
-                        if ext not in DOC_EXT:
+                        if ext in HIDE_ALWAYS or entry.name.lower() in HIDE_NAMES:
                             continue
                         st = entry.stat()
                         files.append(Hit(entry.path, entry.name, st.st_size, st.st_mtime))
@@ -190,6 +252,83 @@ def find_files(
         "complete": exhausted,
         "results": [h.as_dict() for h in hits],
     }
+
+
+def find_folders(
+    query: str,
+    roots: list[str],
+    *,
+    limit: int = 10,
+    deadline: float = DEFAULT_DEADLINE,
+    min_score: float = 0.5,
+    priority: list[str] | None = None,
+) -> dict:
+    """Locate a FOLDER by name.
+
+    find_files only ever returned files, so "what is on my Desktop" had no way
+    to resolve "Desktop" to a path and turned into a long guessing game down
+    C:\\Users. Well-known folders are answered from Windows itself first,
+    which is both instant and correct when OneDrive has redirected them.
+    """
+    from .textutil import normalize
+
+    hits: list[tuple[float, str, str]] = []
+    wanted = normalize(query)
+
+    for name, path in known_folders().items():
+        candidates = [normalize(name)] + [normalize(a) for a in FOLDER_ALIASES.get(name, ())]
+        if wanted and any(wanted in c or c in wanted for c in candidates if c):
+            hits.append((1.0, name, path))
+
+    stop_at = time.monotonic() + deadline
+    seen = {h[2].lower() for h in hits}
+    for root in _order_roots(roots, priority):
+        for dirpath in _walk_dirs(root, stop_at):
+            if dirpath.lower() in seen:
+                continue
+            s = score_expanded(query, os.path.basename(dirpath))
+            if s >= min_score:
+                seen.add(dirpath.lower())
+                hits.append((s, os.path.basename(dirpath), dirpath))
+        if time.monotonic() > stop_at:
+            break
+
+    hits.sort(key=lambda h: h[0], reverse=True)
+    return {
+        "query": query,
+        "results": [
+            {"name": n, "path": p, "score": round(s, 2)} for s, n, p in hits[:limit]
+        ],
+    }
+
+
+def _walk_dirs(root: str, stop_at: float):
+    """Directory-only walk, same guards as :func:`_walk`."""
+    if not os.path.isdir(root):
+        return
+    base_depth = str(root).rstrip("\\/").count(os.sep)
+    stack = [str(root)]
+    while stack:
+        if time.monotonic() > stop_at:
+            return
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        if entry.name.startswith(".") or _is_hidden(entry):
+                            continue
+                        if entry.name.lower() in SKIP_DIRS:
+                            continue
+                        yield entry.path
+                        if entry.path.count(os.sep) - base_depth < MAX_DEPTH:
+                            stack.append(entry.path)
+                    except (OSError, PermissionError):
+                        continue
+        except (PermissionError, OSError, FileNotFoundError):
+            continue
 
 
 def search_in_files(

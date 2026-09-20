@@ -40,9 +40,23 @@ JAVOB USLUBI — bu eng muhim qoida:
   o'zbek kirill yoki rus tili). Aralash yozsa — o'zbek lotinda javob ber.
 - Emoji kam ishlat: faqat ✅ ❌ 📄 kabi bitta belgi.
 
+⛔ ENG QAT'IY QOIDA — FAYL VA PAPKA NOMLARI:
+Nomlarni HECH QACHON tarjima qilma, o'zgartirma yoki o'zingdan to'qima.
+Asbob nima qaytargan bo'lsa — HARFMA-HARF o'shani yoz.
+  · "Desktop" ni "Ish stoli" deb yozish — XATO.
+  · "Documents" ni "Hujjatlar" deb yozish — XATO.
+  · Ro'yxatda yo'q nomni yozish — XATO, bu yolg'on.
+Foydalanuvchi o'sha nom bilan papkani ochadi; noto'g'ri nom uni adashtiradi.
+Javob matni o'zbekcha bo'ladi, LEKIN nomlar asl holida qoladi.
+Asbob bo'sh ro'yxat qaytarsa — "bo'sh" deb ayt, to'ldirib qo'yma.
+
 QANDAY ISHLAYSAN:
-1. Avval `find_files` bilan qidir — u fayl va papka nomlarini o'zbekcha/ruscha/kirillcha
-   variantlari bilan solishtiradi.
+0. Foydalanuvchi PAPKA haqida gapirsa («Desktopda nima bor?», «yuklamalarni
+   ko'rsat») — `find_folder` chaqir, keyin `list_dir`. Disklarni qo'lda
+   kezib chiqma: Windows bu papkalar qayerdaligini aniq biladi, hatto
+   OneDrive ularni ko'chirgan bo'lsa ham.
+1. FAYL so'ralsa — `find_files` bilan qidir. U nomlarni o'zbekcha/ruscha/
+   kirillcha variantlari bilan solishtiradi.
 2. Topilmasa — `list_drives`, keyin `list_dir` bilan papkalarni ochib ko'r.
    Bu bosqichma-bosqich o'rganish: bir marta topgan papkangni keyingi safar tezroq qaraysan.
 3. Nomiga qarab aniq bo'lmasa — `preview_file` bilan ichini ko'r yoki
@@ -111,6 +125,23 @@ TOOLS = [
                 "type": "object",
                 "properties": {"path": {"type": "string"}},
                 "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_folder",
+            "description": (
+                "PAPKANI nom bo'yicha topish. «Desktop», «ish stoli», "
+                "«yuklab olingan», «rasmlar» kabi so'rovlar uchun — Windows'dan "
+                "to'g'ridan-to'g'ri so'raydi, taxmin qilmaydi. "
+                "Papka ichini ko'rish kerak bo'lsa AVVAL shuni chaqir, keyin list_dir."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
             },
         },
     },
@@ -580,8 +611,16 @@ class Brain:
                     )),
                 )
 
+            if name == "find_folder":
+                return await loop.run_in_executor(
+                    None,
+                    lambda: fs.find_folders(
+                        str(args.get("query", "")), roots, priority=priority
+                    ),
+                )
+
             if name == "list_drives":
-                return {"drives": fs.list_drives()}
+                return {"drives": fs.list_drives(), "known_folders": fs.known_folders()}
 
             if name == "list_dir":
                 return await loop.run_in_executor(
@@ -823,14 +862,24 @@ class Brain:
             items = result.get(key)
             if not isinstance(items, list):
                 continue
-            kept = [
-                it for it in items
-                if not (isinstance(it, dict) and self.cfg.is_blocked(it.get("path", "")))
-            ]
-            result[key] = kept
-            for it in kept:
-                if isinstance(it, dict) and it.get("path"):
+            kept = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                if self.cfg.is_blocked(it.get("path", "")):
+                    # Say it exists and is protected. Dropping it silently made
+                    # the agent tell its own owner a file was not there when it
+                    # plainly was - which reads as broken, not as careful.
+                    kept.append({
+                        "name": it.get("name") or os.path.basename(it.get("path", "")),
+                        "protected": True,
+                        "note": "maxfiy deb belgilangan — yuborilmaydi",
+                    })
+                    continue
+                kept.append(it)
+                if it.get("path"):
                     self._sendable.add(os.path.normcase(it["path"]))
+            result[key] = kept
         return result
 
     # ----------------------------------------------------------------- prompt
