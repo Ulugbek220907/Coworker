@@ -222,11 +222,15 @@ class CoworkerAgent:
 
         blocks.append("/status · /forget — suhbatni tozalash")
 
-        missing = [c for c in ("office", "desktop") if c not in caps]
-        if missing:
+        from .config import ALL_CAPS, CAP_LABELS
+
+        locked = [c for c in ALL_CAPS if c not in caps]
+        if locked:
             blocks.append(
-                "Ko'proq imkoniyat kerak bo'lsa — kompyuterdagi Coworker "
-                "ilovasida ruxsat berilishi kerak."
+                "🔒 YOQILMAGAN (lekin mavjud):\n"
+                + "\n".join(f"  · {CAP_LABELS[c]}" for c in locked)
+                + "\n\nYoqish: kompyuterda Coworker ilovasi → Ulanish →\n"
+                "telefonni tanlang → kerakli ruxsatni belgilang."
             )
         return "\n\n".join(blocks)
 

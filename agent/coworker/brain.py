@@ -767,6 +767,24 @@ class Brain:
 
     # ------------------------------------------------------ office / confirm
 
+    def _denied(self, capability: str) -> ToolResult:
+        """Refuse, and say so on the desktop too.
+
+        The person who can grant this is sitting at the machine, not
+        reading the chat - so a refusal that only ever appears in Telegram
+        leaves them with no idea a toggle was even wanted."""
+        from .config import CAP_LABELS
+
+        label = CAP_LABELS.get(capability, capability)
+        self._notify(f"Ruxsat so'raldi: «{label}» — yoqilmagan")
+        return {
+            "error": f"Bu chat uchun «{label}» ruxsati yoqilmagan.",
+            "how_to_enable": (
+                "Coworker ilovasi → Ulanish → telefonni tanlang "
+                f"→ «{label}» ni belgilang"
+            ),
+        }
+
     async def _run_office(self, name: str, args: dict) -> ToolResult | None:
         """Document tools. Returns None if ``name`` is not one of them."""
         from .config import CAP_OFFICE
@@ -774,7 +792,7 @@ class Brain:
         if name not in {"sheet_read", "sheet_list", "to_pdf", "pdf_pages"}:
             return None
         if CAP_OFFICE not in self._caps:
-            return {"error": "Bu chat uchun ruxsat yo'q."}
+            return self._denied(CAP_OFFICE)
 
         from . import office
 
@@ -809,7 +827,7 @@ class Brain:
         if name not in {"list_windows", "read_window", "ui_click", "ui_type"}:
             return None
         if CAP_DESKTOP not in self._caps:
-            return {"error": "Bu chat uchun ekranni ko'rish ruxsati yo'q."}
+            return self._denied(CAP_DESKTOP)
 
         from . import uia
 
@@ -821,7 +839,7 @@ class Brain:
             return await loop.run_in_executor(None, lambda: uia.read_window(title))
 
         if CAP_DESKTOP_CONTROL not in self._caps:
-            return {"error": "Bu chat uchun oynani boshqarish ruxsati yo'q."}
+            return self._denied(CAP_DESKTOP_CONTROL)
 
         handle, ref = int(args.get("handle", 0)), int(args.get("ref", 0))
         if name == "ui_click":
@@ -836,7 +854,7 @@ class Brain:
         if name not in {"web_open", "web_read", "web_type", "web_click", "web_screenshot"}:
             return None
         if CAP_BROWSER not in self._caps:
-            return {"error": "Bu chat uchun brauzer ruxsati yo'q."}
+            return self._denied(CAP_BROWSER)
 
         from . import browser
 
@@ -1092,11 +1110,53 @@ class Brain:
                 "- Rasm kerak bo'lsa: `web_screenshot` → `send_file`."
             )
 
+        locked = self._locked_note()
+        if locked:
+            parts.append(locked)
+
         context = mem.context_block()
         if context:
             parts.append(context)
 
         return "\n\n".join(parts)
+
+    def _locked_note(self) -> str:
+        """Tell the model what it could do but may not.
+
+        Without this it answers "I cannot open a browser" - which is false and
+        a dead end. It can; this chat has not been granted it. The difference
+        between "impossible" and "one toggle away" is the whole answer.
+        """
+        from .config import (
+            CAP_BROWSER, CAP_DESKTOP, CAP_DESKTOP_CONTROL, CAP_LABELS,
+            CAP_OFFICE, CAP_OFFICE_WRITE,
+        )
+
+        examples = {
+            CAP_OFFICE: "Excel ichidagi raqamlarni o'qish, PDF'ga o'girish",
+            CAP_OFFICE_WRITE: "fayldagi kataklarni o'zgartirish",
+            CAP_DESKTOP: "ochiq dastur oynalarini ko'rish",
+            CAP_DESKTOP_CONTROL: "oynadagi tugmalarni bosish, maydonga yozish",
+            CAP_BROWSER: "brauzerda sayt ochish, forma to'ldirish, sahifa o'qish",
+        }
+        missing = [c for c in examples if c not in self._caps]
+        if not missing:
+            return ""
+
+        lines = [f"- «{CAP_LABELS[c]}» — {examples[c]}" for c in missing]
+        return (
+            "QULFLANGAN IMKONIYATLAR (mavjud, lekin BU CHAT uchun yoqilmagan):\n"
+            + "\n".join(lines)
+            + "\n\nFoydalanuvchi shulardan birini so'rasa — «qila olmayman» DEMA, "
+            "bu noto'g'ri. Buning o'rniga aniq yo'lni ko'rsat:\n"
+            "  «Buni qila olaman, lekin bu chat uchun ruxsat yoqilmagan. "
+            "Kompyuterdagi Coworker ilovasi → Ulanish → telefoningizni tanlang "
+            "→ «<kerakli ruxsat nomi>» ni belgilang.»\n"
+            "Ruxsat nomini yuqoridagi ro'yxatdan aynan ko'chirib yoz.\n\n"
+            "«Nimalar qila olasan?» deb so'ralsa — avval hozir ishlaydiganini "
+            "sana, keyin qisqa qilib qulflanganini ham ayt («yoqilsa, buni ham "
+            "qila olaman»). Foydalanuvchi nimasi borligini bilmasa, yoqa olmaydi."
+        )
 
     # ------------------------------------------------------------- compaction
 
