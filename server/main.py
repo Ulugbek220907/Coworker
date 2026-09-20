@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import logging
 import os
+import re
 import time
 
 from fastapi import (
@@ -38,6 +40,24 @@ BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "coworker-hook").strip()
 RELAY_TOKEN = os.getenv("RELAY_TOKEN", "").strip()  # optional agent auth
 PUBLIC_URL = (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL") or "").rstrip("/")
+
+def _telegram_secret(raw: str) -> str:
+    """Telegram only accepts [A-Za-z0-9_-]{1,256} as a webhook secret_token.
+
+    Render's `generateValue: true` produces base64, which contains '+', '/'
+    and '=' - setWebhook then fails with "secret token contains illegal
+    characters" and the bot sits there looking healthy but silent. Hashing
+    keeps the value deterministic and secret while always being legal.
+    """
+    if not raw:
+        return ""
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", raw):
+        return raw
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+# What we actually hand to Telegram and compare incoming headers against.
+TELEGRAM_SECRET = _telegram_secret(WEBHOOK_SECRET)
 
 MAX_VOICE_BYTES = 3 * 1024 * 1024
 MAX_UPLOAD_BYTES = 45 * 1024 * 1024  # Telegram bots cap uploads at 50 MB
@@ -105,7 +125,7 @@ async def _webhook_keeper() -> None:
                 delay = 5.0
                 continue
 
-            res = await tg.set_webhook(want, WEBHOOK_SECRET)
+            res = await tg.set_webhook(want, TELEGRAM_SECRET)
             if res.get("ok"):
                 webhook_state.update({"url": want, "ok": True, "error": ""})
                 log.info("webhook registered -> %s", want)
@@ -157,7 +177,7 @@ async def setup(key: str = "") -> JSONResponse:
         raise HTTPException(403, "bad key")
     if not PUBLIC_URL:
         raise HTTPException(500, "PUBLIC_URL is not set")
-    res = await tg.set_webhook(f"{PUBLIC_URL}/tg", WEBHOOK_SECRET)
+    res = await tg.set_webhook(f"{PUBLIC_URL}/tg", TELEGRAM_SECRET)
     webhook_state.update({
         "url": f"{PUBLIC_URL}/tg" if res.get("ok") else "",
         "ok": bool(res.get("ok")),
@@ -280,7 +300,7 @@ async def webhook(
     request: Request,
     x_telegram_bot_api_secret_token: str = Header(default=""),
 ) -> JSONResponse:
-    if WEBHOOK_SECRET and x_telegram_bot_api_secret_token != WEBHOOK_SECRET:
+    if TELEGRAM_SECRET and x_telegram_bot_api_secret_token != TELEGRAM_SECRET:
         raise HTTPException(403, "bad secret")
     update = await request.json()
     # Answer Telegram immediately; routing happens out of band.
