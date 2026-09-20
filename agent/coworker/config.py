@@ -54,6 +54,26 @@ DEFAULTS: dict[str, Any] = {
 
     # Trusted chats, learned through pairing.
     "chats": [],
+
+    # What each chat is allowed to do, keyed by chat id. A newly paired chat
+    # gets FIND only: the father's phone must never reach the tools that can
+    # change a file, and capability is granted deliberately in the UI rather
+    # than inherited by being trusted at all.
+    "chat_caps": {},
+    "default_caps": ["find"],
+}
+
+# Capability names, narrowest first.
+CAP_FIND = "find"              # search the disk, send a file back
+CAP_OFFICE = "office"          # read spreadsheets, convert to PDF, split PDFs
+CAP_OFFICE_WRITE = "office_write"   # modify a document - always confirmed
+
+ALL_CAPS = (CAP_FIND, CAP_OFFICE, CAP_OFFICE_WRITE)
+
+CAP_LABELS = {
+    CAP_FIND: "Hujjat topish va yuborish",
+    CAP_OFFICE: "Jadvallarni o'qish, PDF'ga o'girish",
+    CAP_OFFICE_WRITE: "Fayllarni o'zgartirish (tasdiq bilan)",
 }
 
 
@@ -130,6 +150,29 @@ class Config:
 
     def revoke(self, chat_id: int) -> None:
         self.set("chats", [c for c in self.chats if c != chat_id])
+        caps = dict(self.data.get("chat_caps", {}))
+        caps.pop(str(chat_id), None)
+        self.set("chat_caps", caps)
+
+    # --------------------------------------------------------- capabilities
+
+    def caps(self, chat_id: int) -> list[str]:
+        stored = self.data.get("chat_caps", {}).get(str(chat_id))
+        if stored is None:
+            return list(self.get("default_caps", [CAP_FIND]))
+        return [c for c in stored if c in ALL_CAPS]
+
+    def set_caps(self, chat_id: int, caps: list[str]) -> None:
+        table = dict(self.data.get("chat_caps", {}))
+        # FIND is what pairing means; there is no useful chat without it.
+        table[str(chat_id)] = sorted(
+            {CAP_FIND, *(c for c in caps if c in ALL_CAPS)},
+            key=ALL_CAPS.index,
+        )
+        self.set("chat_caps", table)
+
+    def allows(self, chat_id: int, capability: str) -> bool:
+        return capability in self.caps(chat_id)
 
     # --------------------------------------------------------- search scope
 

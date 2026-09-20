@@ -17,7 +17,7 @@ from tkinter import messagebox, ttk
 
 from . import tray as tray_mod
 from .app import CoworkerAgent
-from .config import Config
+from .config import ALL_CAPS, CAP_FIND, CAP_LABELS, Config
 from .llm import PROVIDERS
 
 BG = "#12151c"
@@ -123,10 +123,70 @@ class AgentWindow:
             selectbackground=ACCENT, font=("Segoe UI", 10), height=5,
             activestyle="none",
         )
-        self.chats_box.pack(fill="both", expand=True)
+        self.chats_box.pack(fill="x")
+        self.chats_box.bind("<<ListboxSelect>>", self._on_chat_select)
+
+        # Capability is granted per phone, never inherited from being paired.
+        # The father's phone should stay on "find documents" forever.
+        self.caps_frame = tk.Frame(f, bg=CARD)
+        self.caps_frame.pack(fill="x", pady=(10, 0))
+        self.caps_title = tk.Label(
+            self.caps_frame, text="RUXSATLAR", bg=CARD, fg=MUTED,
+            font=("Segoe UI", 8, "bold"),
+        )
+        self.caps_title.pack(anchor="w", padx=12, pady=(10, 4))
+        self.cap_vars: dict[str, tk.BooleanVar] = {}
+        for cap in ALL_CAPS:
+            var = tk.BooleanVar(value=False)
+            self.cap_vars[cap] = var
+            tk.Checkbutton(
+                self.caps_frame, text=CAP_LABELS[cap], variable=var,
+                bg=CARD, fg=FG, selectcolor=BG, activebackground=CARD,
+                activeforeground=FG, font=("Segoe UI", 9), borderwidth=0,
+                highlightthickness=0, state="disabled",
+                command=lambda c=cap: self._toggle_cap(c),
+            ).pack(anchor="w", padx=12)
+        self.caps_hint = tk.Label(
+            self.caps_frame, text="Telefonni tanlang", bg=CARD, fg=MUTED,
+            font=("Segoe UI", 8),
+        )
+        self.caps_hint.pack(anchor="w", padx=12, pady=(2, 10))
+
         self._button(f, "Tanlanganni o'chirish", self._revoke, primary=False).pack(anchor="w", pady=8)
         self._refresh_chats()
         return f
+
+    def _selected_chat(self) -> int | None:
+        sel = self.chats_box.curselection()
+        chats = self.cfg.chats
+        if not sel or sel[0] >= len(chats):
+            return None
+        return chats[sel[0]]
+
+    def _on_chat_select(self, _event=None) -> None:
+        chat_id = self._selected_chat()
+        widgets = [w for w in self.caps_frame.winfo_children() if isinstance(w, tk.Checkbutton)]
+        if chat_id is None:
+            for w in widgets:
+                w.configure(state="disabled")
+            self.caps_hint.configure(text="Telefonni tanlang")
+            return
+
+        current = self.cfg.caps(chat_id)
+        for cap, var in self.cap_vars.items():
+            var.set(cap in current)
+        for cap, w in zip(ALL_CAPS, widgets):
+            # FIND is what pairing means; it cannot be switched off separately.
+            w.configure(state="disabled" if cap == CAP_FIND else "normal")
+        self.caps_hint.configure(text=f"Telegram ID {chat_id}")
+
+    def _toggle_cap(self, _cap: str) -> None:
+        chat_id = self._selected_chat()
+        if chat_id is None:
+            return
+        chosen = [c for c, v in self.cap_vars.items() if v.get()]
+        self.cfg.set_caps(chat_id, chosen)
+        self._log(f"{chat_id} ruxsatlari: {', '.join(self.cfg.caps(chat_id))}")
 
     def _tab_settings(self, parent: ttk.Notebook) -> tk.Frame:
         f = tk.Frame(parent, bg=BG)
@@ -296,6 +356,8 @@ class AgentWindow:
             self.chats_box.insert("end", f"  Telegram ID {chat_id}")
         if not self.cfg.chats:
             self.chats_box.insert("end", "  (hali hech kim ulanmagan)")
+        if hasattr(self, "caps_frame"):
+            self._on_chat_select()
 
     # ---------------------------------------------------------------- events
 

@@ -46,6 +46,7 @@ class CoworkerAgent:
 
         self._locks: dict[int, asyncio.Lock] = {}
         self._pending_options: dict[int, list[str]] = {}
+        self._pending_confirm: dict[int, dict] = {}
         self._current_chat: int | None = None
         self._bad_pairs: list[float] = []
 
@@ -136,6 +137,11 @@ class CoworkerAgent:
         if chat_id not in self.cfg.chats:
             return
         data = str(frame.get("data", ""))
+
+        if data.startswith("confirm:"):
+            await self._on_confirm(chat_id, data == "confirm:yes")
+            return
+
         options = self._pending_options.get(chat_id, [])
 
         choice = data
@@ -151,6 +157,36 @@ class CoworkerAgent:
         self._pending_options.pop(chat_id, None)
         await self._think(chat_id, choice)
 
+    async def _on_confirm(self, chat_id: int, approved: bool) -> None:
+        """Run an action the user tapped to approve.
+
+        The action was frozen when it was proposed and is executed here
+        directly, not handed back to the model - so what runs is exactly what
+        was shown, and a later turn cannot substitute something else.
+        """
+        action = self._pending_confirm.pop(chat_id, None)
+        if action is None:
+            await self.link.reply(chat_id, "Bu so'rov eskirgan. Qaytadan so'rang.")
+            return
+        if not approved:
+            await self.link.reply(chat_id, "❌ Bekor qilindi. Hech narsa o'zgarmadi.")
+            return
+
+        lock = self._locks.setdefault(chat_id, asyncio.Lock())
+        async with lock:
+            self._current_chat = chat_id
+            self.status("working", "o'zgartirilmoqda")
+            try:
+                mem = self.memory.get(chat_id)
+                text = await self.brain.run_confirmed(action, mem, self.cfg.caps(chat_id))
+            except Exception as exc:
+                log.exception("confirmed action failed")
+                text = f"⚠️ Xato: {str(exc)[:150]}"
+            finally:
+                self._current_chat = None
+            await self.link.reply(chat_id, text)
+            self.status("online", self.cfg.pair_code)
+
     # ---------------------------------------------------------------- worker
 
     async def _think(self, chat_id: int, text: str) -> None:
@@ -165,7 +201,7 @@ class CoworkerAgent:
             typing = asyncio.create_task(self._keep_typing(chat_id))
             try:
                 mem = self.memory.get(chat_id)
-                payload = await self.brain.handle(mem, text)
+                payload = await self.brain.handle(mem, text, self.cfg.caps(chat_id))
             except Exception as exc:
                 log.exception("think failed")
                 payload = {"text": f"⚠️ Xato: {str(exc)[:150]}"}
@@ -175,6 +211,8 @@ class CoworkerAgent:
 
             if payload.get("options"):
                 self._pending_options[chat_id] = payload["options"]
+            if payload.get("confirm"):
+                self._pending_confirm[chat_id] = payload["confirm"]
             await self.link.reply(chat_id, payload.get("text", ""), payload.get("buttons"))
             self.status("online", self.cfg.pair_code)
 

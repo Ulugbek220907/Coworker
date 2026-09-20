@@ -100,19 +100,84 @@ def _read_docx(p: Path, limit: int) -> str:
 
 
 def _read_xlsx(p: Path, limit: int) -> str:
-    """Shared strings hold nearly all human-readable text in a workbook."""
+    """Walk the worksheets cell by cell.
+
+    Reading only ``sharedStrings.xml`` is the obvious shortcut and it is
+    wrong twice over: numbers never appear there at all, and writers such as
+    openpyxl emit inline strings instead, producing a workbook with no shared
+    string table whatsoever. Either way the interesting content - the amounts
+    somebody is asking about - is invisible. So resolve each cell properly.
+    """
     parts: list[str] = []
     with zipfile.ZipFile(p) as z:
         names = z.namelist()
+
+        shared: list[str] = []
         if "xl/sharedStrings.xml" in names:
-            xml = _decode(z.read("xl/sharedStrings.xml"))
-            xml = re.sub(r"</si>", "\n", xml)
-            parts.append(_TAG.sub("", xml))
-        # Sheet names are a strong signal too.
+            table = _decode(z.read("xl/sharedStrings.xml"))
+            # One entry per <si>, with its runs flattened.
+            shared = [
+                _unescape(_TAG.sub("", si))
+                for si in re.findall(r"<si>(.*?)</si>", table, re.S)
+            ]
+
         if "xl/workbook.xml" in names:
             wb = _decode(z.read("xl/workbook.xml"))
-            parts.append(" ".join(re.findall(r'<sheet[^>]*name="([^"]+)"', wb)))
-    return _unescape("\n".join(parts))[:limit]
+            sheet_names = re.findall(r'<sheet[^>]*name="([^"]+)"', wb)
+        else:
+            sheet_names = []
+
+        sheets = sorted(
+            (n for n in names if re.fullmatch(r"xl/worksheets/sheet\d+\.xml", n)),
+            key=lambda n: int(re.search(r"(\d+)", n).group(1)),
+        )
+        for i, name in enumerate(sheets):
+            title = _unescape(sheet_names[i]) if i < len(sheet_names) else f"Sheet{i + 1}"
+            parts.append(f"[{title}]")
+            parts.append(_read_sheet_xml(_decode(z.read(name)), shared))
+            if sum(len(x) for x in parts) > limit:
+                break
+
+    return _clean("\n".join(parts))[:limit]
+
+
+_ROW = re.compile(r"<row\b[^>]*>(.*?)</row>", re.S)
+_CELL = re.compile(r"<c\b([^>]*?)(?:/>|>(.*?)</c>)", re.S)
+_VALUE = re.compile(r"<v>(.*?)</v>", re.S)
+
+
+def _read_sheet_xml(xml: str, shared: list[str]) -> str:
+    """One text line per spreadsheet row, cells separated by tabs."""
+    lines: list[str] = []
+    for body in _ROW.findall(xml):
+        cells: list[str] = []
+        for attrs, content in _CELL.findall(body):
+            if not content:
+                continue
+            kind = (re.search(r'\bt="([^"]+)"', attrs) or [None, "n"])[1]
+
+            if kind == "inlineStr":
+                cells.append(_unescape(_TAG.sub("", content)).strip())
+                continue
+
+            raw = _VALUE.search(content)
+            if not raw:
+                continue
+            text = _unescape(raw.group(1)).strip()
+
+            if kind == "s":                       # index into the shared table
+                try:
+                    text = shared[int(text)]
+                except (ValueError, IndexError):
+                    pass
+            elif kind == "b":
+                text = "TRUE" if text == "1" else "FALSE"
+            cells.append(text)
+
+        line = "\t".join(c for c in cells if c)
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
 
 
 def _read_pptx(p: Path, limit: int) -> str:
@@ -133,9 +198,12 @@ def _read_pptx(p: Path, limit: int) -> str:
 
 def _read_pdf(p: Path, limit: int) -> str:
     try:
-        import fitz  # PyMuPDF - optional
+        import pymupdf as fitz      # PyMuPDF; `fitz` is the legacy alias
     except ImportError:
-        return ""
+        try:
+            import fitz
+        except ImportError:
+            return ""
     out: list[str] = []
     with fitz.open(p) as doc:
         for page in doc:

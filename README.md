@@ -163,6 +163,52 @@ pip install faster-whisper av    # standart
 pip install vosk                 # yengilroq muqobil
 ```
 
+## Hujjat bilan ishlash (sichqonchasiz)
+
+Agent nafaqat topadi, balki hujjat ustida ish ham qila oladi — **sichqonchaga
+tegmasdan, skrinshotsiz, ekran qulflangan bo'lsa ham**. Bu Microsoft'ning UFO
+tadqiqotidagi qoida: *avval API, GUI — oxirgi chora*.
+
+| Asbob | Nima qiladi | Kerak bo'ladigan narsa |
+|---|---|---|
+| `sheet_read` | Excel jadvalini raqamlari bilan o'qiydi | hech narsa (openpyxl) |
+| `sheet_list` | Varaqlar ro'yxati | hech narsa |
+| `pdf_pages` | PDF'dan kerakli betlarni ajratadi | PyMuPDF |
+| `to_pdf` | Word/Excel → PDF | MS Office **yoki** LibreOffice |
+| `sheet_write` | Kataklarni o'zgartiradi | tasdiq + zaxira nusxa |
+
+Office o'rnatilmagan kompyuterda `to_pdf` **jim qolmaydi** — buni ochiq aytadi.
+Qolgan hamma narsa Officesiz ham ishlaydi.
+
+### Ruxsatlar — har bir telefon uchun alohida
+
+Ulanish o'z-o'zidan hech qanday qo'shimcha huquq bermaydi. Ilovadagi
+**Ulanish** bo'limida telefonni tanlab, ruxsat berasiz:
+
+| Ruxsat | Nima ochiladi |
+|---|---|
+| `find` | Hujjat topish va yuborish (har doim yoqilgan) |
+| `office` | Jadval o'qish, PDF'ga o'girish, bet ajratish |
+| `office_write` | Fayl o'zgartirish — **har safar tasdiq so'raladi** |
+
+Dadangizning telefoni `find` da qoladi. Yangi ulangan chat ham shunday
+boshlanadi — ruxsat meros qilib olinmaydi, qo'lda beriladi.
+
+### O'zgartirish oqimi
+
+```
+  Dada: hisobotda B2 ni 1 500 000 000 qil
+    AI: ⚠️ Faylni o'zgartirmoqchiman:
+        📄 Hisobot_Q1.xlsx  (Январь varag'i)
+          B2 → 1500000000
+        Zaxira nusxa olinadi. Davom etaymi?
+        [ ✅ Ha, bajar ]  [ ❌ Bekor qilish ]
+```
+
+Tugma bosilganda **model emas, tizim** bajaradi: tasdiqlangan amal muzlatib
+qo'yiladi, shuning uchun keyingi qadamda boshqa narsa almashtirib bo'lmaydi.
+Har o'zgartirishdan oldin `fayl.backup-YYYYMMDD-HHMMSS.xlsx` yaratiladi.
+
 ## Xavfsizlik
 
 - **Faqat ulangan chatlar.** Kod noutbuk ekranida ko'rinadi va bir martalik.

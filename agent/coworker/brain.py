@@ -204,6 +204,124 @@ TOOLS = [
 ]
 
 
+# Offered only to a chat holding CAP_OFFICE. None of these touch the mouse or
+# the screen - they go through the file format or through Office's own API,
+# which works with the screen locked and steals nobody's focus.
+OFFICE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "sheet_read",
+            "description": (
+                "Excel faylining ichidagi jadvalni O'QISH — raqamlari bilan. "
+                "«Hisobotda foyda qancha?» kabi savollar uchun. "
+                "preview_file jadvalni yaxshi ko'rsatmaydi, buni ishlat."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "sheet": {"type": "string", "description": "Varaq nomi (ixtiyoriy)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "sheet_list",
+            "description": "Excel faylidagi varaqlar ro'yxati va o'lchamlari.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "to_pdf",
+            "description": (
+                "Word/Excel/PowerPoint faylini PDF'ga o'girish. Asl fayl "
+                "o'zgarmaydi — yangi PDF yaratiladi. Telefonda o'qish uchun "
+                "qulay. Natijani send_file bilan yubor."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "pdf_pages",
+            "description": (
+                "PDF'dan faqat kerakli sahifalarni ajratib olish. "
+                "«3-betini yubor» kabi so'rovlar uchun."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "pages": {"type": "string", "description": "Masalan: 3 yoki 1-5 yoki 2,4,7"},
+                },
+                "required": ["path", "pages"],
+            },
+        },
+    },
+]
+
+# Requires CAP_OFFICE_WRITE, and never executes directly - see _CONFIRM_TOOLS.
+WRITE_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "sheet_write",
+            "description": (
+                "Excel faylidagi kataklarni o'zgartirish. Foydalanuvchidan "
+                "tasdiq so'raladi. Avval zaxira nusxa olinadi."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "sheet": {"type": "string"},
+                    "changes": {
+                        "type": "object",
+                        "description": 'Katak: qiymat, masalan {"B5": 500000}',
+                    },
+                },
+                "required": ["path", "changes"],
+            },
+        },
+    },
+]
+
+# Tools that are proposed to the user and executed only after an explicit tap.
+_CONFIRM_TOOLS = {"sheet_write"}
+
+
+def tools_for(caps: list[str]) -> list[dict]:
+    """The tool surface a given chat is allowed to see at all.
+
+    Capability is enforced by omission first - a tool that is never offered
+    cannot be called by a confused model or a hijacked one - and checked again
+    at dispatch, because the model can still invent a name.
+    """
+    from .config import CAP_OFFICE, CAP_OFFICE_WRITE
+
+    out = list(TOOLS)
+    if CAP_OFFICE in caps:
+        out += OFFICE_TOOLS
+    if CAP_OFFICE_WRITE in caps:
+        out += WRITE_TOOLS
+    return out
+
+
 class Brain:
     def __init__(self, cfg: Config, llm: LLM, send_file: Sender, notify: Callable[[str], None] | None = None) -> None:
         self.cfg = cfg
@@ -213,8 +331,11 @@ class Brain:
 
     # ------------------------------------------------------------------ entry
 
-    async def handle(self, mem: ChatMemory, user_text: str) -> dict:
+    async def handle(self, mem: ChatMemory, user_text: str, caps: list[str] | None = None) -> dict:
         """Run the loop for one user message. Returns a reply frame payload."""
+        from .config import CAP_FIND
+
+        self._caps = list(caps) if caps else [CAP_FIND]
         mem.add_turn("user", user_text)
 
         # Only files this turn's own searches surfaced may be sent. A document
@@ -232,6 +353,7 @@ class Brain:
 
         pending_buttons: list[list[dict]] | None = None
         pending_options: list[str] = []
+        pending_confirm: dict | None = None
         sent_count = 0
         text_out = ""
 
@@ -239,7 +361,7 @@ class Brain:
             try:
                 msg = await self.llm.chat(
                     messages,
-                    tools=TOOLS,
+                    tools=tools_for(self._caps),
                     max_tokens=700,
                     temperature=0.2,
                 )
@@ -275,6 +397,27 @@ class Brain:
                     pending_buttons = _buttons(options)
                     pending_options = options
                     text_out = question
+                    finish_now = True
+                    break
+
+                if name in _CONFIRM_TOOLS:
+                    # Propose, never perform. The action is frozen here and
+                    # replayed verbatim on approval, so the model gets no
+                    # second chance to alter what the user agreed to.
+                    gate = self._describe_action(name, args)
+                    if gate.get("error"):
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call.get("id", ""),
+                            "content": json.dumps(gate, ensure_ascii=False),
+                        })
+                        continue
+                    pending_confirm = {"tool": name, "args": args}
+                    pending_buttons = [
+                        [{"text": "✅ Ha, bajar", "callback_data": "confirm:yes"}],
+                        [{"text": "❌ Bekor qilish", "callback_data": "confirm:no"}],
+                    ]
+                    text_out = gate["summary"]
                     finish_now = True
                     break
 
@@ -317,6 +460,8 @@ class Brain:
         if pending_buttons:
             payload["buttons"] = pending_buttons
             payload["options"] = pending_options
+        if pending_confirm:
+            payload["confirm"] = pending_confirm
         return payload
 
     # ------------------------------------------------------------------ tools
@@ -327,6 +472,10 @@ class Brain:
         priority = self.cfg.get("priority_dirs", [])
 
         try:
+            office_result = await self._run_office(name, args)
+            if office_result is not None:
+                return office_result
+
             if name == "find_files":
                 root = args.get("root")
                 scope = [root] if root and os.path.isdir(root) else roots
@@ -406,6 +555,110 @@ class Brain:
             self.cfg.remember_dir(os.path.dirname(path))
         return {"ok": ok, "name": os.path.basename(path)}
 
+    # ------------------------------------------------------ office / confirm
+
+    async def _run_office(self, name: str, args: dict) -> ToolResult | None:
+        """Document tools. Returns None if ``name`` is not one of them."""
+        from .config import CAP_OFFICE
+
+        if name not in {"sheet_read", "sheet_list", "to_pdf", "pdf_pages"}:
+            return None
+        if CAP_OFFICE not in self._caps:
+            return {"error": "Bu chat uchun ruxsat yo'q."}
+
+        from . import office
+
+        path = str(args.get("path", ""))
+        if not path or self.cfg.is_blocked(path):
+            return {"error": "Fayl mavjud emas yoki maxfiy."}
+        if os.path.normcase(path) not in self._sendable:
+            return {"error": "Avval faylni qidiruv bilan toping."}
+
+        loop = asyncio.get_running_loop()
+        if name == "sheet_list":
+            return await loop.run_in_executor(None, lambda: office.sheet_list(path))
+        if name == "sheet_read":
+            sheet = args.get("sheet") or None
+            return await loop.run_in_executor(None, lambda: office.sheet_read(path, sheet))
+
+        # to_pdf and pdf_pages both produce a NEW file, which the user plainly
+        # wants delivered - so it joins the sendable set on success.
+        if name == "to_pdf":
+            result = await loop.run_in_executor(None, lambda: office.to_pdf(path))
+        else:
+            pages = str(args.get("pages", ""))
+            result = await loop.run_in_executor(None, lambda: office.pdf_pages(path, pages))
+        if result.get("ok") and result.get("path"):
+            self._sendable.add(os.path.normcase(result["path"]))
+        return result
+
+    def _describe_action(self, name: str, args: dict) -> dict:
+        """Plain-language summary of a destructive action, for the user to approve."""
+        from .config import CAP_OFFICE_WRITE
+
+        if CAP_OFFICE_WRITE not in self._caps:
+            return {"error": "Bu chat uchun fayl o'zgartirish ruxsati yo'q."}
+
+        path = str(args.get("path", ""))
+        if not path or not os.path.isfile(path) or self.cfg.is_blocked(path):
+            return {"error": "Fayl topilmadi yoki maxfiy."}
+        if os.path.normcase(path) not in self._sendable:
+            return {"error": "Avval faylni qidiruv bilan toping."}
+
+        if name == "sheet_write":
+            changes = args.get("changes") or {}
+            if not isinstance(changes, dict) or not changes:
+                return {"error": "O'zgarishlar ko'rsatilmagan."}
+            lines = [f"  {ref} → {value}" for ref, value in list(changes.items())[:8]]
+            sheet = args.get("sheet")
+            return {"summary": (
+                f"⚠️ Faylni o'zgartirmoqchiman:\n"
+                f"📄 {os.path.basename(path)}"
+                + (f"  ({sheet} varag'i)" if sheet else "")
+                + "\n" + "\n".join(lines)
+                + "\n\nZaxira nusxa olinadi. Davom etaymi?"
+            )}
+        return {"error": f"Noma'lum amal: {name}"}
+
+    async def run_confirmed(self, action: dict, mem: ChatMemory, caps: list[str]) -> str:
+        """Execute an action the user approved. Called from the callback path,
+        not from the model, so the approved action is what actually runs."""
+        self._caps = list(caps)
+        name = action.get("tool")
+        args = action.get("args") or {}
+        if name not in _CONFIRM_TOOLS:
+            return "❌ Noma'lum amal."
+
+        # Re-check on the way in: capability or the file may have changed
+        # between the proposal and the tap.
+        self._sendable = {os.path.normcase(str(args.get("path", "")))}
+        gate = self._describe_action(name, args)
+        if gate.get("error"):
+            return f"❌ {gate['error']}"
+
+        from . import office
+
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: office.sheet_write(
+                str(args["path"]), dict(args.get("changes") or {}), args.get("sheet") or None
+            ),
+        )
+        if not result.get("ok"):
+            return f"❌ {result.get('error', 'Bajarilmadi')}"
+
+        applied = ", ".join(f"{k}={v}" for k, v in (result.get("applied") or {}).items())
+        mem.remember(
+            f"{os.path.basename(str(args['path']))} faylida o'zgartirildi: {applied}",
+            kind="action",
+        )
+        return (
+            f"✅ Saqlandi: {os.path.basename(result['path'])}\n"
+            f"{applied}\n"
+            f"Zaxira: {os.path.basename(result.get('backup', ''))}"
+        )
+
     def _filter(self, result: dict) -> dict:
         """Strip blocked files from a tool result, and record what survived as
         eligible to send. This is the only place `_sendable` grows."""
@@ -436,6 +689,29 @@ class Brain:
             parts.append(
                 "AVVAL FOYDALI BO'LGAN PAPKALAR (birinchi shularni qara):\n"
                 + "\n".join(f"- {p}" for p in priority[:8])
+            )
+
+        from .config import CAP_OFFICE, CAP_OFFICE_WRITE
+
+        if CAP_OFFICE in self._caps:
+            from . import office
+
+            caps = office.capabilities()
+            parts.append(
+                "HUJJAT ASBOBLARI:\n"
+                "- Excel faylining ichidagi raqamlar so'ralsa — `preview_file` EMAS,\n"
+                "  `sheet_read` ishlat. preview_file jadvalni to'liq ko'rsatmaydi.\n"
+                "- «PDF qilib yubor» deyilsa: `to_pdf` → keyin `send_file`.\n"
+                "- «3-betini yubor» deyilsa: `pdf_pages` → keyin `send_file`.\n"
+                + ("- PDF'ga o'girish bu kompyuterda ISHLAMAYDI (Office ham,\n"
+                   "  LibreOffice ham o'rnatilmagan). So'ralsa shuni ayt.\n"
+                   if not caps["pdf_to_pdf"] else "")
+            )
+        if CAP_OFFICE_WRITE in self._caps:
+            parts.append(
+                "O'ZGARTIRISH: `sheet_write` chaqirsang, u DARHOL bajarilmaydi — "
+                "foydalanuvchiga tasdiq tugmasi chiqadi. Shuning uchun o'zing "
+                "qo'shimcha «rozimisiz?» deb so'rama, to'g'ridan-to'g'ri chaqir."
             )
 
         context = mem.context_block()

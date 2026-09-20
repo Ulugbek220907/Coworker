@@ -7,9 +7,18 @@ websockets>=12.0
 pystray>=0.19
 pillow>=10.0
 
+# Reading spreadsheets with their numbers, and editing cells.
+openpyxl>=3.1
+
 # --- optional, but recommended -------------------------------------------
-# PDF text extraction (.docx/.xlsx/.pptx work without any of this)
+# PDF text extraction and page surgery. Document text extraction for
+# .docx/.xlsx/.pptx works without any of this - those are ZIP+XML.
 pymupdf>=1.24
+
+# Converting Office documents to PDF through a real Office install.
+# Only useful on Windows WITH Microsoft Office; LibreOffice is used as a
+# fallback, and without either the agent says so rather than guessing.
+pywin32>=306; sys_platform == 'win32'
 
 # Voice messages. faster-whisper handles mixed Uzbek/Russian speech and
 # auto-detects the language; vosk is lighter (~50 MB) but single-language.
