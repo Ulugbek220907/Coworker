@@ -7,12 +7,15 @@ back through ``root.after`` because Tk is not thread-safe.
 from __future__ import annotations
 
 import asyncio
+import os
 import queue
 import threading
+import time
 import tkinter as tk
 import webbrowser
 from tkinter import messagebox, ttk
 
+from . import tray as tray_mod
 from .app import CoworkerAgent
 from .config import Config
 from .llm import PROVIDERS
@@ -41,6 +44,9 @@ class AgentWindow:
         self.events: queue.Queue[tuple[str, str]] = queue.Queue()
         self.agent: CoworkerAgent | None = None
         self.loop: asyncio.AbstractEventLoop | None = None
+        self.tray = tray_mod.Tray(lambda: None, lambda: None)
+        self.has_tray = False
+        self._told_about_tray = False
 
         self.root = tk.Tk()
         self.root.title("Coworker")
@@ -177,6 +183,17 @@ class AgentWindow:
         self.stt_status = tk.Label(srow, text="", bg=BG, fg=MUTED, font=("Segoe UI", 8))
         self.stt_status.pack(side="left", padx=10)
 
+        tk.Label(body, text="ISHGA TUSHISH", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(16, 4))
+        self.autostart = tk.BooleanVar(value=tray_mod.autostart_enabled())
+        tk.Checkbutton(body, text="Kompyuter yonganda o'zi ishga tushsin",
+                       variable=self.autostart, bg=BG, fg=FG, selectcolor=CARD,
+                       activebackground=BG, activeforeground=FG,
+                       font=("Segoe UI", 9), borderwidth=0,
+                       highlightthickness=0).pack(anchor="w")
+        tk.Label(body, text="Oyna yopilsa ilova tray'da ishlashda davom etadi.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 0))
+
         actions = tk.Frame(body, bg=BG)
         actions.pack(fill="x", pady=18)
         self._button(actions, "Saqlash", self._save).pack(side="left")
@@ -311,6 +328,7 @@ class AgentWindow:
         elif state == "offline" and detail:
             text = f"{label} — {detail}"
         self.status_text.configure(text=text)
+        self.tray.update(state, text)
         if state in ("offline", "connecting"):
             self._log(f"{label}: {detail}")
 
@@ -324,8 +342,27 @@ class AgentWindow:
 
     def start(self) -> None:
         threading.Thread(target=self._run_loop, daemon=True).start()
+        self.tray = tray_mod.Tray(self._show_window, self._quit)
+        self.has_tray = self.tray.start()
+        if not self.has_tray:
+            self._log("Tray ishlamadi — oyna yopilsa ilova to'xtaydi. "
+                      "Tuzatish: pip install pystray pillow")
         self.root.after(600, self._show_stt_status)
         self.root.mainloop()
+        self._hard_exit()
+
+    def _hard_exit(self) -> None:
+        """pystray runs its backend on non-daemon threads, so returning from
+        mainloop normally would leave this process alive and invisible - still
+        holding the WebSocket and answering Telegram after the user quit.
+        Give the agent a moment to close its socket, then exit for real."""
+        self.tray.stop()
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline:
+            if self.agent is None or not self.agent.link.connected:
+                break
+            time.sleep(0.05)
+        os._exit(0)
 
     def _run_loop(self) -> None:
         self.loop = asyncio.new_event_loop()
@@ -341,9 +378,32 @@ class AgentWindow:
             self.stt_status.configure(text=self.agent.stt.status)
 
     def _on_close(self) -> None:
+        """The X button hides to the tray - the agent must keep running."""
+        if not self.has_tray:
+            self._quit()
+            return
+        self.root.withdraw()
+        if not self._told_about_tray:
+            self._told_about_tray = True
+            self.tray.notify(
+                "Coworker fonda ishlashda davom etmoqda. "
+                "Butunlay chiqish uchun tray belgisiga o'ng tugma bosing."
+            )
+
+    def _show_window(self) -> None:
+        """Called from the tray thread - bounce onto the Tk thread."""
+        self.root.after(0, self._raise_window)
+
+    def _raise_window(self) -> None:
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+
+    def _quit(self) -> None:
         if self.agent and self.loop:
             asyncio.run_coroutine_threadsafe(self.agent.stop(), self.loop)
-        self.root.destroy()
+        self.tray.stop()
+        self.root.after(0, self.root.destroy)
 
 
 def main() -> None:

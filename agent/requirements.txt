@@ -2,6 +2,11 @@
 httpx>=0.27
 websockets>=12.0
 
+# Tray icon, so closing the window keeps the agent running in the background
+# instead of quitting. Without these the X button really does quit.
+pystray>=0.19
+pillow>=10.0
+
 # --- optional, but recommended -------------------------------------------
 # PDF text extraction (.docx/.xlsx/.pptx work without any of this)
 pymupdf>=1.24

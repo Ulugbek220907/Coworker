@@ -103,6 +103,19 @@ Tamom. Endi shunchaki yozish mumkin.
 
 Buyruqlar: `/status` · `/forget` (suhbatni tozalash) · `/disconnect`
 
+### Fonda ishlash
+
+Oynaning **X** tugmasi ilovani yopmaydi — tray'ga yashiradi va agent ishlashda
+davom etadi. Butunlay chiqish uchun tray belgisiga o'ng tugma → **Chiqish**.
+
+Sozlamalarda **«Kompyuter yonganda o'zi ishga tushsin»** ni yoqsangiz, noutbuk
+har yonganda Coworker o'zi ishga tushadi — ya'ni dadangiz ilovani ochishni
+eslab qolishi shart emas. Bu Windows'ning `HKCU\...\Run` kalitiga yoziladi,
+admin huquqi talab qilmaydi.
+
+> Windows xizmati (service) sifatida emas, oddiy foydalanuvchi ilovasi sifatida
+> ishlaydi — bu ataylab: xizmat session 0 da, ekransiz ishlaydi.
+
 ---
 
 ## Uch til, bitta qidiruv
