@@ -47,6 +47,10 @@ DEFAULTS: dict[str, Any] = {
     "reply_language": "auto",       # auto | uz | ru
     "max_reply_chars": 600,
 
+    # Browser. Headless hides the window; visible is the default so the
+    # user can sign in to sites once and watch what the agent does.
+    "browser_headless": False,
+
     # Speech to text
     "stt_enabled": True,
     "stt_engine": "auto",           # auto | faster-whisper | vosk | off
@@ -69,8 +73,12 @@ CAP_OFFICE = "office"          # read spreadsheets, convert to PDF, split PDFs
 CAP_OFFICE_WRITE = "office_write"   # modify a document - always confirmed
 CAP_DESKTOP = "desktop"             # read open windows as a text tree
 CAP_DESKTOP_CONTROL = "desktop_control"   # click and type into them
+CAP_BROWSER = "browser"             # open and drive web pages
 
-ALL_CAPS = (CAP_FIND, CAP_OFFICE, CAP_OFFICE_WRITE, CAP_DESKTOP, CAP_DESKTOP_CONTROL)
+ALL_CAPS = (
+    CAP_FIND, CAP_OFFICE, CAP_OFFICE_WRITE,
+    CAP_DESKTOP, CAP_DESKTOP_CONTROL, CAP_BROWSER,
+)
 
 CAP_LABELS = {
     CAP_FIND: "Hujjat topish va yuborish",
@@ -78,6 +86,7 @@ CAP_LABELS = {
     CAP_OFFICE_WRITE: "Fayllarni o'zgartirish (tasdiq bilan)",
     CAP_DESKTOP: "Ochiq oynalarni ko'rish",
     CAP_DESKTOP_CONTROL: "Oynalarni boshqarish (bosish, yozish)",
+    CAP_BROWSER: "Brauzer: sayt ochish va to'ldirish",
 }
 
 

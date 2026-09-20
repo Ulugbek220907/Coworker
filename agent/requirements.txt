@@ -15,6 +15,11 @@ openpyxl>=3.1
 # no screenshots, no GPU.
 uiautomation>=2.0; sys_platform == 'win32'
 
+# Browser control. A page already knows its own structure, so reading the
+# DOM beats reading a picture of it. After installing, fetch the browser:
+#     playwright install chromium
+playwright>=1.44
+
 # --- optional, but recommended -------------------------------------------
 # PDF text extraction and page surgery. Document text extraction for
 # .docx/.xlsx/.pptx works without any of this - those are ZIP+XML.

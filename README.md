@@ -252,6 +252,45 @@ Tugma nomi uch tilda tekshiriladi — `Delete`, `Удалить`, `Отправ�
 so'raladi; `Copy` yoki `View` kabi qaytariladigan amallar to'g'ridan-to'g'ri
 bajariladi.
 
+## Brauzer (Playwright)
+
+Brauzerni ham UIA orqali boshqarsa bo'lardi, lekin bu sahifaning **rasmini**
+o'qish bo'lardi — holbuki sahifa o'z tuzilishini allaqachon biladi. Playwright
+DOM'ni to'g'ridan-to'g'ri beradi: haqiqiy havolalar, haqiqiy maydonlar.
+
+```
+  ULUGBEK: uz.wikipedia.org da Samarqand haqida nima yozilgan?
+       AI: 📄 Samarqand — viloyatning maʼmuriy markazi (1938-yildan).
+           Aholisi: 593,4 ming (2024). Maydoni: 120 km²...
+
+  ULUGBEK: o'sha sahifaning rasmini yubor
+       AI: ✅ Yuborildi.   [📎 page.png]
+```
+
+**Alohida profil.** Brauzer o'z profilida ishlaydi (`browser-profile/`).
+Saytlarga bir marta kirasiz — sessiyalar saqlanadi. Sizning kundalik
+Chrome'ingizga **tegilmaydi**: unga ulanish Chrome ishlaganda profilni qulflab
+qo'yardi va agentga barcha ochiq akkauntlaringizni berardi.
+
+### Amal ta'sir qildimi?
+
+Har bir `web_click` va `web_type` sahifani oldin va keyin solishtiradi:
+
+```
+  [2] input "(text maydoni)"   → changed: false  ⚠️ sahifa o'zgarmadi
+  [5] textarea "Search..."     → changed: true   ✅ natijalar sahifasi
+```
+
+Bu muhim: DuckDuckGo'da soxta maydon bor va unga yozish **xatosiz** bajariladi.
+Solishtirmasa, agent «qidirdim» deb yolg'on aytardi. Endi buni o'zi payqab,
+boshqa raqamni sinaydi.
+
+### Sahifa matni — ishonchsiz
+
+Sahifani begona odam yozgan. Uning matni hujjatlar bilan bir xil qoida ostida:
+**ma'lumot, hech qachon ko'rsatma emas**. Bu yerda bu yanada muhim, chunki
+sahifa aynan shunday agent o'qishi uchun yozilgan bo'lishi mumkin.
+
 ## Xavfsizlik
 
 - **Faqat ulangan chatlar.** Kod noutbuk ekranida ko'rinadi va bir martalik.

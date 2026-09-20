@@ -22,6 +22,9 @@ dist/
 
 # models downloaded at runtime
 models/
+
+# browser profile - holds real logged-in sessions and cookies
+browser-profile/
 *.zip
 
 # os
