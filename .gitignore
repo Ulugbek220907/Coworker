@@ -1,0 +1,30 @@
+# secrets - never commit these
+.env
+*.env
+!.env.example
+config.json
+agent/config.json
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+*.egg-info/
+.pytest_cache/
+
+# build artefacts
+build/
+dist/
+*.spec
+!scripts/*.spec
+
+# models downloaded at runtime
+models/
+*.zip
+
+# os
+Thumbs.db
+.DS_Store
+desktop.ini

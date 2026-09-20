@@ -1,0 +1,13 @@
+# --- required -------------------------------------------------------------
+httpx>=0.27
+websockets>=12.0
+
+# --- optional, but recommended -------------------------------------------
+# PDF text extraction (.docx/.xlsx/.pptx work without any of this)
+pymupdf>=1.24
+
+# Voice messages. faster-whisper handles mixed Uzbek/Russian speech and
+# auto-detects the language; vosk is lighter (~50 MB) but single-language.
+faster-whisper>=1.0
+av>=12.0            # decodes the OGG/Opus that Telegram sends
+# vosk>=0.3.45      # uncomment for the lightweight alternative

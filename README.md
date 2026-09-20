@@ -1,0 +1,193 @@
+# Coworker
+
+Uyda qolgan noutbukdagi hujjatni Telegram orqali topib beradigan yordamchi.
+
+Dadam noutbukni ish joyiga olib borishni unutsa, menga qo'ng'iroq qilib
+"falon faylni topib yubor" deb aytardi. Coworker shu ishni o'zi qiladi:
+dadam botga oddiy tilda yozadi yoki ovozli xabar yuboradi, uydagi noutbuk
+faylni topib, to'g'ridan-to'g'ri telefoniga yuboradi.
+
+```
+  Telefon                    Render (bepul)              Uydagi noutbuk
+ ┌─────────┐   webhook     ┌────────────────┐   WSS    ┌──────────────────┐
+ │ Telegram│ ────────────► │  relay server  │ ◄──────► │  Coworker agent  │
+ │   bot   │ ◄──────────── │  (faqat pochta)│          │  · fayl qidiruv  │
+ └─────────┘   xabar+fayl  └────────────────┘          │  · AI miyasi     │
+                                                       │  · ovoz → matn   │
+                                                       └──────────────────┘
+```
+
+Server **faqat pochtachi**: u hech qanday faylni saqlamaydi, diskni ko'rmaydi
+va AI kalitini bilmaydi. Butun aql noutbukda ishlaydi. Shuning uchun Render'ning
+bepul 512 MB'lik tarifi yetarli, va hujjatlaringiz uchinchi serverga tushmaydi.
+
+---
+
+## Nega bunday qurilgan
+
+| Qaror | Sabab |
+|---|---|
+| Noutbuk **o'zi** serverga ulanadi (WebSocket) | Router sozlash, port ochish, statik IP kerak emas — har qanday uy internetida ishlaydi |
+| Ma'lumotlar bazasi yo'q | Agent har ulanganda ishonchli chatlar ro'yxatini o'zi aytadi. Render qayta ishga tushsa — hech narsa yo'qolmaydi |
+| AI noutbukda | Fayl mazmuni serverga chiqmaydi; Render bepul tarifi yengil qoladi |
+| Indeks oldindan qurilmaydi | AI diskni odam kabi bosqichma-bosqich o'rganadi va savol beradi |
+| Ovoz noutbukda taniladi | Bepul, internetsiz, API to'lovsiz |
+
+---
+
+## 1-qadam — Serverni Render'ga qo'yish
+
+1. Render'da **New → Blueprint** → shu repozitoriyni tanlang.
+   `render.yaml` hamma narsani o'zi sozlaydi.
+2. Faqat bitta o'zgaruvchini qo'lda kiriting:
+
+   | Nom | Qiymat |
+   |---|---|
+   | `TELEGRAM_BOT_TOKEN` | @BotFather bergan token |
+
+   `WEBHOOK_SECRET` va `RELAY_TOKEN` avtomatik yaratiladi.
+3. Deploy tugagach manzilni nusxalang, masalan
+   `https://coworker-relay.onrender.com`.
+   Webhook avtomatik ro'yxatdan o'tadi — qo'shimcha ish yo'q.
+
+> **Bepul tarif haqida:** Render bepul servisni 15 daqiqa jimlikdan keyin
+> uxlatadi. Agent har 4 daqiqada `/healthz` ga ping yuboradi, shuning uchun
+> noutbuk yoqiq ekan server uxlamaydi. Agar baribir uxlab qolsa, birinchi
+> xabar ~50 soniya kechikadi, keyin normal ishlaydi.
+
+## 2-qadam — Noutbukka ilovani o'rnatish
+
+```bash
+git clone https://github.com/Ulugbek220907/Coworker.git
+cd Coworker/agent
+pip install -r requirements.txt
+python run.py
+```
+
+Ochilgan oynada **Sozlamalar** bo'limini to'ldiring:
+
+- **Server manzili** — Render bergan URL
+- **AI modeli** — ro'yxatdan tanlang, API kalitni qo'ying
+- **Server maxfiy kaliti** — Render'dagi `RELAY_TOKEN` qiymati
+- **Qidiruv doirasi** — bo'sh qoldirsangiz barcha disklar qidiriladi
+
+**Saqlash** → ilovani qayta oching.
+
+## 3-qadam — Telefonni ulash
+
+Ilova oynasida 6 xonali kod chiqadi. Telegramda botga yuboring:
+
+```
+/connect 967241
+```
+
+Tamom. Endi shunchaki yozish mumkin.
+
+---
+
+## Qanday ishlatiladi
+
+```
+  Dada: tekstil zavodi bilan shartnoma kerak edi
+    AI: ✅ Yuborildi: Шартнома_Текстил_завод_2026.txt   [📎 fayl]
+
+  Dada: hisobot kerak edi
+    AI: Qaysi hisobot kerak?
+        [ Йиллик_хисобот_2026.txt ]
+        [ Налоговый_отчет_Q1.txt  ]
+
+  Dada: (ovozli xabar) "o'tgan oygi buxgalteriya hisoboti"
+    AI: 🎤 «o'tgan oygi buxgalteriya hisoboti»
+        ✅ Yuborildi: Ҳисобот_август.xlsx   [📎 fayl]
+```
+
+Buyruqlar: `/status` · `/forget` (suhbatni tozalash) · `/disconnect`
+
+---
+
+## Uch til, bitta qidiruv
+
+Papkalar kirillcha, so'rov lotincha bo'lishi mumkin — muhim emas.
+Hammasi bitta shaklga keltiriladi, so'ng tarjima lug'ati qo'shiladi:
+
+| So'rov | Topadi |
+|---|---|
+| `tekstil shartnoma` | `Договор_текстиль_2024.docx` |
+| `договор текстиль` | `Shartnoma_tekstil_zavod.docx` |
+| `zavod hisoboti` | `Отчет_фабрика_2024.xlsx` |
+| `shartnomani` | `Шартнома...` (qo'shimchalar kesiladi) |
+
+`shartnoma = договор = kontrakt`, `hisobot = отчет`, `zavod = фабрика` —
+25 ga yaqin guruh [`textutil.py`](agent/coworker/textutil.py) ichida.
+
+## Xotira — faqat oxirgi xabarga qaramaydi
+
+Har so'rovda AI to'rt qatlamni ko'radi:
+
+1. **Eslab qolingan ma'lumotlar** — "zavod deganda Tekstil zavodini nazarda
+   tutaman" degan gap abadiy saqlanadi
+2. **Suhbat xulosasi** — eski xabarlar o'chirilmaydi, qisqartiriladi
+3. **Yaqinda yuborilgan fayllar** — "o'shani yana yubor" shuning uchun ishlaydi
+4. **Oxirgi 14 ta xabar** — to'liq holicha
+
+Bundan tashqari muvaffaqiyatli topilgan papka eslab qolinadi va keyingi safar
+birinchi bo'lib qaraladi — ya'ni ilova ishlatilgani sayin tezlashadi.
+
+## Ovozli xabar
+
+Ikkalasi ham bepul, ochiq kodli va **internetsiz, noutbukning o'zida** ishlaydi:
+
+| Engine | Hajmi | Kuchli tomoni |
+|---|---|---|
+| **faster-whisper** (standart) | ~145 MB (`base`) | Tilni o'zi aniqlaydi — o'zbekcha va ruschani aralash gapirsa ham tushunadi |
+| **vosk** | ~50 MB | Juda yengil, eski noutbukda ham tez. Alohida o'zbekcha modeli bor |
+
+Model birinchi ovozli xabarda avtomatik yuklanadi. Kerak bo'lmasa
+Sozlamalarda `off` qilib qo'ying.
+
+```bash
+pip install faster-whisper av    # standart
+pip install vosk                 # yengilroq muqobil
+```
+
+## Xavfsizlik
+
+- **Faqat ulangan chatlar.** Kod noutbuk ekranida ko'rinadi va bir martalik.
+  5 marta noto'g'ri kiritilsa 10 daqiqaga bloklanadi.
+- **Maxfiy fayllar hech qachon yuborilmaydi.** `parol`, `api key`, `.env`,
+  `.pem`, `wallet` va shunga o'xshash nomlar tizim darajasida to'siladi —
+  AI xohlasa ham o'tkazmaydi. Ro'yxat `config.json` da kengaytiriladi.
+- **Fayllar serverda saqlanmaydi** — oqim orqali o'tib ketadi.
+- **`RELAY_TOKEN`** qo'yilsa, boshqa hech kim o'z agentini ulay olmaydi.
+
+## Loyiha tuzilishi
+
+```
+server/          Render'dagi pochtachi
+  main.py          webhook, WebSocket, fayl uzatish
+  relay.py         ulangan agentlar reestri (xotirada)
+  telegram.py      Bot API
+agent/           noutbukdagi ilova
+  run.py           kirish nuqtasi (--headless ham bor)
+  coworker/
+    ui.py          oyna
+    app.py         orkestratsiya
+    brain.py       AI sikli va asboblar
+    fs.py          disk bo'ylab qidiruv
+    textutil.py    kirill/lotin + tarjima lug'ati
+    extract.py     docx/xlsx/pptx/pdf dan matn
+    memory.py      to'rt qatlamli xotira
+    stt.py         ovoz → matn
+    llm.py         OpenAI-mos klient
+    config.py      sozlamalar va xavfsizlik
+```
+
+## AI provayderini almashtirish
+
+Har qanday OpenAI-mos endpoint ishlaydi. Sozlamalardagi ro'yxatda:
+DeepSeek, GLM (BigModel / z.ai), Groq, OpenRouter, va **Ollama** — oxirgisi
+noutbukning o'zida ishlaydi, ya'ni internetsiz va butunlay bepul.
+
+## Litsenziya
+
+MIT

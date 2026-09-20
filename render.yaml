@@ -1,0 +1,21 @@
+# Render blueprint - free tier.
+# Deploy: New > Blueprint > point at this repo, then paste TELEGRAM_BOT_TOKEN.
+services:
+  - type: web
+    name: coworker-relay
+    runtime: python
+    plan: free
+    region: frankfurt          # closest free region to Central Asia
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false            # paste it in the Render dashboard, never in git
+      - key: WEBHOOK_SECRET
+        generateValue: true    # Render invents one and keeps it secret
+      - key: RELAY_TOKEN
+        generateValue: true    # copy into the desktop app's settings
+      - key: PYTHON_VERSION
+        value: "3.12.4"
