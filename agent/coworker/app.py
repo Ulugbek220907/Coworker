@@ -116,6 +116,9 @@ class CoworkerAgent:
             return
 
         low = text.lower()
+        if low.startswith("/help") or low.startswith("/start"):
+            await self.link.reply(chat_id, self._capability_help(chat_id))
+            return
         if low.startswith("/forget"):
             self.memory.get(chat_id).clear()
             await self.link.reply(chat_id, "🧹 Suhbat tozalandi. Eslab qolingan papkalar saqlanib qoldi.")
@@ -156,6 +159,76 @@ class CoworkerAgent:
 
         self._pending_options.pop(chat_id, None)
         await self._think(chat_id, choice)
+
+    def _capability_help(self, chat_id: int) -> str:
+        """Describe what THIS chat can actually do, right now.
+
+        A fixed blurb goes stale the moment capabilities change, and it also
+        promises things a restricted chat cannot do - which is worse than
+        saying too little.
+        """
+        from . import office, uia
+        from .config import (
+            CAP_DESKTOP, CAP_DESKTOP_CONTROL, CAP_OFFICE, CAP_OFFICE_WRITE,
+        )
+
+        caps = self.cfg.caps(chat_id)
+        blocks = [f"\U0001f916 Men «{self.cfg.get('name')}» kompyuteridaman."]
+
+        blocks.append(
+            "📁 HUJJAT TOPISH\n"
+            "Oddiy tilda so'rang — o'zbekcha, ruscha, kirill yoki lotin:\n"
+            "  · «zavod bilan shartnoma kerak edi»\n"
+            "  · «договор с текстильным заводом»\n"
+            "Ichidagi matndan ham qidiraman va faylni yuboraman."
+        )
+
+        if CAP_OFFICE in caps:
+            backends = office.capabilities()
+            lines = [
+                "📊 JADVAL VA PDF",
+                "  · «hisobotda foyda qancha?» — Excel ichidagi raqamlarni o'qiyman",
+                "  · «3-betini yubor» — PDF'dan kerakli betni ajrataman",
+            ]
+            if backends["pdf_to_pdf"]:
+                lines.append("  · «PDF qilib yubor» — Word/Excel'ni PDF'ga o'giraman")
+            else:
+                lines.append("  · PDF'ga o'girish ishlamaydi (Office o'rnatilmagan)")
+            blocks.append("\n".join(lines))
+
+        if CAP_OFFICE_WRITE in caps:
+            blocks.append(
+                "✏️ O'ZGARTIRISH\n"
+                "  · «B5 ni 500000 qil» — katakni o'zgartiraman\n"
+                "  Har safar tasdiq so'rayman va zaxira nusxa olaman."
+            )
+
+        if CAP_DESKTOP in caps:
+            lines = ["🪟 EKRAN", "  · «qanday dasturlar ochiq?»"]
+            if CAP_DESKTOP_CONTROL in caps:
+                lines += [
+                    "  · «Explorer'da qidiruvga shuni yoz»",
+                    "  · Tugmalarni bosaman. O'chirish/yuborish kabi",
+                    "    qaytarib bo'lmaydigan amallarda tasdiq so'rayman.",
+                ]
+            else:
+                lines.append("  · Oynadagi tugmalarni ko'ra olaman, lekin bosa olmayman.")
+            if not uia.available():
+                lines.append("  ⚠️ Hozir ishlamaydi: pip install uiautomation")
+            blocks.append("\n".join(lines))
+
+        if self.cfg.get("stt_enabled", True) and self.stt.available:
+            blocks.append("🎤 Ovozli xabar ham yuborsangiz bo'ladi.")
+
+        blocks.append("/status · /forget — suhbatni tozalash")
+
+        missing = [c for c in ("office", "desktop") if c not in caps]
+        if missing:
+            blocks.append(
+                "Ko'proq imkoniyat kerak bo'lsa — kompyuterdagi Coworker "
+                "ilovasida ruxsat berilishi kerak."
+            )
+        return "\n\n".join(blocks)
 
     async def _on_confirm(self, chat_id: int, approved: bool) -> None:
         """Run an action the user tapped to approve.

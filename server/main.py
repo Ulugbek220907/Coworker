@@ -360,13 +360,22 @@ async def _route_message(msg: dict) -> None:
     low = text.lower()
 
     if low.startswith("/start") or low.startswith("/help"):
-        await tg.send_text(chat_id, HELP)
-        if registry.by_chat(chat_id) is None:
+        # Only the agent knows this chat's capabilities, so let it answer when
+        # one is connected - otherwise the bot describes powers it may not have.
+        agent = registry.by_chat(chat_id)
+        if agent is None:
+            await tg.send_text(chat_id, HELP)
             await tg.send_text(
                 chat_id,
                 "Boshlash uchun kompyuterda Coworker ilovasini oching va "
                 "u ko'rsatgan kodni yuboring:\n\n/connect 123456",
             )
+            return
+        if not await agent.send({
+            "type": "message", "kind": "text", "chat_id": chat_id,
+            "user": who, "text": "/help",
+        }):
+            await tg.send_text(chat_id, HELP)
         return
 
     if low.startswith("/connect"):

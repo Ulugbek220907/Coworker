@@ -10,6 +10,11 @@ pillow>=10.0
 # Reading spreadsheets with their numbers, and editing cells.
 openpyxl>=3.1
 
+# Reading and driving Windows GUIs through the accessibility tree.
+# This is what lets a text-only model click buttons - no vision model,
+# no screenshots, no GPU.
+uiautomation>=2.0; sys_platform == 'win32'
+
 # --- optional, but recommended -------------------------------------------
 # PDF text extraction and page surgery. Document text extraction for
 # .docx/.xlsx/.pptx works without any of this - those are ZIP+XML.

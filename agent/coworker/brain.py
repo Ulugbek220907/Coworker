@@ -301,8 +301,79 @@ WRITE_TOOLS = [
     },
 ]
 
+# Requires CAP_DESKTOP. Reading the screen only - no clicking.
+DESKTOP_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "list_windows",
+            "description": "Hozir ochiq turgan dastur oynalari ro'yxati.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_window",
+            "description": (
+                "Oynadagi tugma, maydon va menyularni raqamlangan ro'yxat "
+                "qilib o'qish. Bosishdan OLDIN majburiy — raqamlar shu yerdan "
+                "olinadi. Oyna o'zgarsa qayta o'qi."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Oyna sarlavhasining bir qismi"},
+                },
+                "required": ["title"],
+            },
+        },
+    },
+]
+
+# Requires CAP_DESKTOP_CONTROL.
+CONTROL_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "ui_click",
+            "description": (
+                "read_window bergan raqamdagi elementni bosish. "
+                "O'chirish/yuborish kabi qaytarib bo'lmaydigan tugmalar uchun "
+                "foydalanuvchidan tasdiq so'raladi."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "integer", "description": "read_window qaytargan handle"},
+                    "ref": {"type": "integer", "description": "Element raqami, masalan 7"},
+                },
+                "required": ["handle", "ref"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ui_type",
+            "description": "Matn maydoniga yozish (eski matn o'rniga).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "integer"},
+                    "ref": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["handle", "ref", "text"],
+            },
+        },
+    },
+]
+
 # Tools that are proposed to the user and executed only after an explicit tap.
-_CONFIRM_TOOLS = {"sheet_write"}
+# ui_click is conditional: only an irreversible-looking label is confirmed, so
+# ordinary navigation stays fluid.
+_CONFIRM_TOOLS = {"sheet_write", "ui_click"}
 
 
 def tools_for(caps: list[str]) -> list[dict]:
@@ -312,13 +383,21 @@ def tools_for(caps: list[str]) -> list[dict]:
     cannot be called by a confused model or a hijacked one - and checked again
     at dispatch, because the model can still invent a name.
     """
-    from .config import CAP_OFFICE, CAP_OFFICE_WRITE
+    from .config import (
+        CAP_DESKTOP, CAP_DESKTOP_CONTROL, CAP_OFFICE, CAP_OFFICE_WRITE,
+    )
 
     out = list(TOOLS)
     if CAP_OFFICE in caps:
         out += OFFICE_TOOLS
     if CAP_OFFICE_WRITE in caps:
         out += WRITE_TOOLS
+    if CAP_DESKTOP in caps:
+        out += DESKTOP_TOOLS
+    # Clicking without being able to read the screen first is nonsense,
+    # so control implies desktop.
+    if CAP_DESKTOP_CONTROL in caps and CAP_DESKTOP in caps:
+        out += CONTROL_TOOLS
     return out
 
 
@@ -405,6 +484,16 @@ class Brain:
                     # replayed verbatim on approval, so the model gets no
                     # second chance to alter what the user agreed to.
                     gate = self._describe_action(name, args)
+                    if gate.get("skip"):
+                        # Reversible enough to just do - the user asked for
+                        # confirmation on dangerous actions, not every click.
+                        result = await self._run_tool(name, args, mem)
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call.get("id", ""),
+                            "content": json.dumps(result, ensure_ascii=False)[:4000],
+                        })
+                        continue
                     if gate.get("error"):
                         messages.append({
                             "role": "tool",
@@ -475,6 +564,10 @@ class Brain:
             office_result = await self._run_office(name, args)
             if office_result is not None:
                 return office_result
+
+            desktop_result = await self._run_desktop(name, args)
+            if desktop_result is not None:
+                return desktop_result
 
             if name == "find_files":
                 root = args.get("root")
@@ -592,9 +685,58 @@ class Brain:
             self._sendable.add(os.path.normcase(result["path"]))
         return result
 
+    async def _run_desktop(self, name: str, args: dict) -> ToolResult | None:
+        """Screen reading and control. Returns None if not a desktop tool."""
+        from .config import CAP_DESKTOP, CAP_DESKTOP_CONTROL
+
+        if name not in {"list_windows", "read_window", "ui_click", "ui_type"}:
+            return None
+        if CAP_DESKTOP not in self._caps:
+            return {"error": "Bu chat uchun ekranni ko'rish ruxsati yo'q."}
+
+        from . import uia
+
+        loop = asyncio.get_running_loop()
+        if name == "list_windows":
+            return await loop.run_in_executor(None, uia.list_windows)
+        if name == "read_window":
+            title = str(args.get("title", ""))
+            return await loop.run_in_executor(None, lambda: uia.read_window(title))
+
+        if CAP_DESKTOP_CONTROL not in self._caps:
+            return {"error": "Bu chat uchun oynani boshqarish ruxsati yo'q."}
+
+        handle, ref = int(args.get("handle", 0)), int(args.get("ref", 0))
+        if name == "ui_click":
+            return await loop.run_in_executor(None, lambda: uia.click(handle, ref))
+        text = str(args.get("text", ""))
+        return await loop.run_in_executor(None, lambda: uia.set_text(handle, ref, text))
+
     def _describe_action(self, name: str, args: dict) -> dict:
-        """Plain-language summary of a destructive action, for the user to approve."""
-        from .config import CAP_OFFICE_WRITE
+        """Plain-language summary of a destructive action, for the user to approve.
+
+        Returns {"skip": True} when the action is reversible enough to just
+        run - the user asked to be asked about dangerous things, not about
+        every click.
+        """
+        from .config import CAP_DESKTOP_CONTROL, CAP_OFFICE_WRITE
+
+        if name == "ui_click":
+            if CAP_DESKTOP_CONTROL not in self._caps:
+                return {"error": "Bu chat uchun oynani boshqarish ruxsati yo'q."}
+            from . import uia
+
+            snap = uia._snapshots.get(int(args.get("handle", 0)))
+            element = snap.by_ref(int(args.get("ref", 0))) if snap else None
+            if element is None:
+                return {"skip": True}      # let the tool itself report the miss
+            if not uia.is_dangerous(element.name):
+                return {"skip": True}
+            return {"summary": (
+                f"⚠️ Qaytarib bo'lmaydigan amal:\n"
+                f"🖱 «{element.name}» tugmasi bosiladi\n"
+                f"🪟 {snap.title}\n\nDavom etaymi?"
+            )}
 
         if CAP_OFFICE_WRITE not in self._caps:
             return {"error": "Bu chat uchun fayl o'zgartirish ruxsati yo'q."}
@@ -628,6 +770,21 @@ class Brain:
         args = action.get("args") or {}
         if name not in _CONFIRM_TOOLS:
             return "❌ Noma'lum amal."
+
+        if name == "ui_click":
+            from . import uia
+
+            gate = self._describe_action(name, args)
+            if gate.get("error"):
+                return f"❌ {gate['error']}"
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: uia.click(int(args.get("handle", 0)), int(args.get("ref", 0))),
+            )
+            if not result.get("ok"):
+                return f"❌ {result.get('error', 'Bajarilmadi')}"
+            return f"✅ Bosildi: {result.get('clicked')}"
 
         # Re-check on the way in: capability or the file may have changed
         # between the proposal and the tap.
@@ -712,6 +869,23 @@ class Brain:
                 "O'ZGARTIRISH: `sheet_write` chaqirsang, u DARHOL bajarilmaydi — "
                 "foydalanuvchiga tasdiq tugmasi chiqadi. Shuning uchun o'zing "
                 "qo'shimcha «rozimisiz?» deb so'rama, to'g'ridan-to'g'ri chaqir."
+            )
+
+        from .config import CAP_DESKTOP as _CD, CAP_DESKTOP_CONTROL as _CDC
+
+        if _CD in self._caps:
+            parts.append(
+                "EKRAN ASBOBLARI:\n"
+                "- Tartib: `list_windows` → `read_window` → keyin amal.\n"
+                "- `read_window` har bir elementga raqam beradi. Bosishdan oldin\n"
+                "  ALBATTA o'qi — raqamni o'zingdan to'qima.\n"
+                "- Oyna o'zgargan bo'lsa (yangi bet, dialog ochildi) — qayta o'qi.\n"
+                "- Element ro'yxati bo'sh kelsa: bu Electron ilova (VS Code, Discord,\n"
+                "  Claude) bo'lishi mumkin — ularda accessibility o'chiq. Shuni ayt,\n"
+                "  taxmin qilib bosma."
+                + ("\n- O'chirish/yuborish kabi tugmalarda tizim tasdiq so'raydi —\n"
+                   "  sen qo'shimcha so'rama, to'g'ridan-to'g'ri chaqir."
+                   if _CDC in self._caps else "")
             )
 
         context = mem.context_block()

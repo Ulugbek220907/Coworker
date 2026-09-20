@@ -67,13 +67,17 @@ DEFAULTS: dict[str, Any] = {
 CAP_FIND = "find"              # search the disk, send a file back
 CAP_OFFICE = "office"          # read spreadsheets, convert to PDF, split PDFs
 CAP_OFFICE_WRITE = "office_write"   # modify a document - always confirmed
+CAP_DESKTOP = "desktop"             # read open windows as a text tree
+CAP_DESKTOP_CONTROL = "desktop_control"   # click and type into them
 
-ALL_CAPS = (CAP_FIND, CAP_OFFICE, CAP_OFFICE_WRITE)
+ALL_CAPS = (CAP_FIND, CAP_OFFICE, CAP_OFFICE_WRITE, CAP_DESKTOP, CAP_DESKTOP_CONTROL)
 
 CAP_LABELS = {
     CAP_FIND: "Hujjat topish va yuborish",
     CAP_OFFICE: "Jadvallarni o'qish, PDF'ga o'girish",
     CAP_OFFICE_WRITE: "Fayllarni o'zgartirish (tasdiq bilan)",
+    CAP_DESKTOP: "Ochiq oynalarni ko'rish",
+    CAP_DESKTOP_CONTROL: "Oynalarni boshqarish (bosish, yozish)",
 }
 
 

@@ -209,6 +209,49 @@ Tugma bosilganda **model emas, tizim** bajaradi: tasdiqlangan amal muzlatib
 qo'yiladi, shuning uchun keyingi qadamda boshqa narsa almashtirib bo'lmaydi.
 Har o'zgartirishdan oldin `fayl.backup-YYYYMMDD-HHMMSS.xlsx` yaratiladi.
 
+## Ekranni boshqarish (UIA)
+
+Windows har bir tugma, maydon va menyuni **strukturali matn** qilib beradi —
+nomi, turi, holati va koordinatasi bilan. Shuning uchun oddiy matn modeli
+(DeepSeek) GUI'ni boshqara oladi: vision model ham, GPU ham, skrinshot ham
+kerak emas.
+
+```
+  ULUGBEK: File Explorer oynasida qanday tugmalar bor?
+       AI: New, Cut, Copy, Paste, Rename, Share, Delete, Sort, View...
+
+  ULUGBEK: qidiruv maydoniga 'hisobot' deb yoz
+       AI: ✅ "hisobot" qidiruv maydoniga yozildi.
+```
+
+Bir oyna ~500 token. Xom UIA daraxti buning 5–10 barobari bo'lardi, shuning
+uchun filtrlash bu yerda optimizatsiya emas — **asosiy ish**: bo'sh nomlar,
+takrorlangan yo'l-ko'rsatkichlar va ikonka shriftining maxfiy belgilari
+tashlab yuboriladi.
+
+**Bosish UIA pattern orqali** amalga oshiriladi (`InvokePattern` va hokazo) —
+bu fon oynada ham ishlaydi, sichqonchani qimirlatmaydi va fokusni
+o'g'irlamaydi. Faqat pattern topilmasa haqiqiy klik ishlatiladi.
+
+### O'lchab bilingan cheklovlar
+
+| Holat | Natija |
+|---|---|
+| Tabiiy Windows oynalari (Explorer, Word, dialoglar) | ~250 element, 1.5s — to'liq ishlaydi |
+| **Electron ilovalar** (VS Code, Discord, Claude) | 19–24 element — daraxt deyarli bo'sh |
+| O'chirilgan tugmalar | `(o'chiq)` deb belgilanadi — AI ko'r-ko'rona bosmaydi |
+
+Electron ilovalarda Chromium accessibility'ni sukut bo'yicha o'chirib qo'yadi.
+Ular **qotib qolmaydi** (tadqiqotdagi deadlock takrorlanmadi), lekin
+boshqarib ham bo'lmaydi — agent buni ochiq aytadi.
+
+### Xavfli amallar
+
+Tugma nomi uch tilda tekshiriladi — `Delete`, `Удалить`, `Отправить`,
+`o'chirish`, `Pay` va hokazo. Bunday tugma bosilishidan oldin tasdiq
+so'raladi; `Copy` yoki `View` kabi qaytariladigan amallar to'g'ridan-to'g'ri
+bajariladi.
+
 ## Xavfsizlik
 
 - **Faqat ulangan chatlar.** Kod noutbuk ekranida ko'rinadi va bir martalik.

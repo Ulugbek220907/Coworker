@@ -40,11 +40,16 @@ def main() -> None:
     args = parser.parse_args()
 
     cfg = Config(args.config)
-    if args.headless:
-        _headless(cfg)
-    else:
-        from coworker.ui import AgentWindow
-        AgentWindow(cfg).start()
+    try:
+        if args.headless:
+            _headless(cfg)
+        else:
+            from coworker.ui import AgentWindow
+            AgentWindow(cfg).start()
+    except KeyboardInterrupt:
+        # Ctrl+C in the launching terminal is a normal way to stop this,
+        # not a crash - a traceback here just looks like a bug.
+        print("\n  Coworker to'xtatildi.")
 
 
 if __name__ == "__main__":
