@@ -32,8 +32,23 @@ class Telegram:
         await self._client.aclose()
 
     async def call(self, method: str, **params: Any) -> dict:
-        r = await self._client.post(f"{self.base}/{method}", json=params)
-        data = r.json()
+        """Always returns a dict. A gateway 502, an HTML error page or a
+        dropped connection must not take down the routing task that called us."""
+        try:
+            r = await self._client.post(f"{self.base}/{method}", json=params)
+        except httpx.HTTPError as exc:
+            log.warning("telegram %s unreachable: %s", method, exc)
+            return {"ok": False, "description": f"network error: {exc}"}
+
+        try:
+            data = r.json()
+        except ValueError:
+            log.warning("telegram %s returned non-JSON (%s): %s",
+                        method, r.status_code, r.text[:200])
+            return {"ok": False, "description": f"HTTP {r.status_code}: {r.text[:200]}"}
+
+        if not isinstance(data, dict):
+            return {"ok": False, "description": f"unexpected payload: {str(data)[:200]}"}
         if not data.get("ok"):
             log.warning("telegram %s failed: %s", method, data.get("description"))
         return data
