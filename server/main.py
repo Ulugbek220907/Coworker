@@ -37,8 +37,23 @@ logging.basicConfig(
 log = logging.getLogger("server")
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "coworker-hook").strip()
-RELAY_TOKEN = os.getenv("RELAY_TOKEN", "").strip()  # optional agent auth
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+RELAY_TOKEN = os.getenv("RELAY_TOKEN", "").strip()
+
+# Both of these used to fail OPEN - WEBHOOK_SECRET had a hardcoded default
+# that is public in this repo, and RELAY_TOKEN was only enforced "if set".
+# A relay that boots with no authentication is worse than one that refuses
+# to boot, because nothing about it looks wrong from the outside.
+if not WEBHOOK_SECRET or WEBHOOK_SECRET == "coworker-hook":
+    raise SystemExit(
+        "WEBHOOK_SECRET is missing or still the example value. Set it to a "
+        "random string (on Render: generateValue) and redeploy."
+    )
+if not RELAY_TOKEN:
+    raise SystemExit(
+        "RELAY_TOKEN is not set. Without it anyone can attach an agent to "
+        "this relay. Set it and put the same value in the desktop app."
+    )
 PUBLIC_URL = (os.getenv("RENDER_EXTERNAL_URL") or os.getenv("PUBLIC_URL") or "").rstrip("/")
 
 def _telegram_secret(raw: str) -> str:
@@ -197,7 +212,7 @@ async def ws_agent(ws: WebSocket) -> None:
         if hello.get("type") != "hello":
             await ws.close(code=4001, reason="expected hello")
             return
-        if RELAY_TOKEN and hello.get("relay_token") != RELAY_TOKEN:
+        if hello.get("relay_token") != RELAY_TOKEN:
             await ws.close(code=4003, reason="bad relay token")
             return
 
@@ -277,7 +292,7 @@ async def upload(
     """Agents stream documents through here rather than over the WebSocket."""
     if not tg:
         raise HTTPException(503, "bot disabled")
-    if RELAY_TOKEN and relay_token != RELAY_TOKEN:
+    if relay_token != RELAY_TOKEN:
         raise HTTPException(403, "bad relay token")
 
     agent = registry.by_id(agent_id)

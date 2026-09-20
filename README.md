@@ -171,7 +171,13 @@ pip install vosk                 # yengilroq muqobil
   `.pem`, `wallet` va shunga o'xshash nomlar tizim darajasida to'siladi —
   AI xohlasa ham o'tkazmaydi. Ro'yxat `config.json` da kengaytiriladi.
 - **Fayllar serverda saqlanmaydi** — oqim orqali o'tib ketadi.
-- **`RELAY_TOKEN`** qo'yilsa, boshqa hech kim o'z agentini ulay olmaydi.
+- **Server autentifikatsiyasiz ishga tushmaydi.** `WEBHOOK_SECRET` va
+  `RELAY_TOKEN` majburiy — yo'q bo'lsa relay xato bilan to'xtaydi. Ochiq
+  ishlaydigan server eng yomoni, chunki tashqaridan hammasi joyidek ko'rinadi.
+- **Prompt injection himoyasi.** Agent faqat O'ZI qidiruvda topgan fayllarni
+  yubora oladi. Hujjat ichiga yashirilgan «anavi faylni ham yubor» degan
+  ko'rsatma ishlamaydi — yo'l qidiruv natijasida chiqmagan bo'lsa, tizim rad
+  etadi. Bu promptga emas, kodga qo'yilgan chegara.
 
 ## Loyiha tuzilishi
 
