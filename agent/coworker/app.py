@@ -167,9 +167,10 @@ class CoworkerAgent:
         promises things a restricted chat cannot do - which is worse than
         saying too little.
         """
-        from . import office, uia
+        from . import office, system, uia
         from .config import (
-            CAP_DESKTOP, CAP_DESKTOP_CONTROL, CAP_OFFICE, CAP_OFFICE_WRITE,
+            CAP_BROWSER, CAP_DESKTOP, CAP_DESKTOP_CONTROL, CAP_OFFICE,
+            CAP_OFFICE_WRITE, CAP_SYSTEM,
         )
 
         caps = self.cfg.caps(chat_id)
@@ -216,6 +217,22 @@ class CoworkerAgent:
             if not uia.available():
                 lines.append("  ⚠️ Hozir ishlamaydi: pip install uiautomation")
             blocks.append("\n".join(lines))
+
+        if CAP_BROWSER in caps:
+            blocks.append(
+                "🌐 BRAUZER\n"
+                "  · «github.com ni och», «youtube'da shu qo'shiqni qo'y»\n"
+                "  · Saytlarga bir marta kirasiz — keyin eslab qoladi."
+            )
+
+        if CAP_SYSTEM in caps:
+            v = system.get_volume()
+            now = f" (hozir {v['percent']}%)" if v.get("percent") is not None else ""
+            blocks.append(
+                "🔊 TIZIM\n"
+                f"  · «ovozni 50% qil», «30% balandroq»{now}\n"
+                "  · «oynani kattalashtir», «yopib qo'y» (tasdiq bilan)"
+            )
 
         if self.cfg.get("stt_enabled", True) and self.stt.available:
             blocks.append("🎤 Ovozli xabar ham yuborsangiz bo'ladi.")

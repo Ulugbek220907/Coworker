@@ -291,6 +291,43 @@ Sahifani begona odam yozgan. Uning matni hujjatlar bilan bir xil qoida ostida:
 **ma'lumot, hech qachon ko'rsatma emas**. Bu yerda bu yanada muhim, chunki
 sahifa aynan shunday agent o'qishi uchun yozilgan bo'lishi mumkin.
 
+## Tizim boshqaruvi (ovoz va oynalar)
+
+`system` ruxsati bilan agent tizim ovozini va oyna holatini boshqaradi —
+hammasi native Windows API orqali, sichqonchasiz:
+
+```
+  u: ovozni 30% balandroq qil
+ AI: ✅ Ovoz 80% qilindi.
+
+  u: brauzer oynasini kattalashtir
+ AI: ✅ Oyna kattalashtirildi.
+
+  u: Claude oynasini yopib qoy
+ AI: ⚠️ Oynani yopmoqchiman: 🪟 Claude
+     Saqlanmagan ma'lumot yo'qolishi mumkin. Davom etaymi?
+     [ ✅ Ha ]  [ ❌ Bekor ]
+```
+
+Ovoz va katta/kichik qilish darhol bajariladi; **oyna yopish** — qaytarib
+bo'lmaydi, shuning uchun tasdiq so'raydi.
+
+> Nozik xato bo'lgan: ovoz (pycaw) va oyna (uiautomation) ikkalasi ham
+> `comtypes` ishlatadi, va uning kod generatsiyasi thread'ga xavfsiz emas —
+> ovozdan keyin oyna o'qilganda jarayon **segfault** bo'lardi. Yechim:
+> `uiautomation` COM ishga tushishidan oldin import qilinadi va butun COM
+> ishi bitta thread'da bajariladi.
+
+## Haqiqiy Chrome
+
+Brauzer endi Playwright'ning «Chrome for Testing» build'i emas, **mashinadagi
+haqiqiy Google Chrome**'ni ishlatadi (`channel="chrome"`). Bu eclass.uz kabi
+saytlar ochilmagan muammoni hal qiladi — render va tarmoq odatdagi Chrome
+bilan bir xil. Chrome yo'q bo'lsa, Playwright'ning Chromium'iga qaytadi.
+
+> Bu **alohida profil** — sizning kundalik Chrome akkauntlaringiz emas.
+> Kerakli saytlarga agent oynasida bir marta kirasiz, sessiya saqlanadi.
+
 ## Xavfsizlik
 
 - **Faqat ulangan chatlar.** Kod noutbuk ekranida ko'rinadi va bir martalik.

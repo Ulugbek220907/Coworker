@@ -472,10 +472,77 @@ BROWSER_TOOLS = [
     },
 ]
 
+# Requires CAP_SYSTEM. Native Windows APIs - volume and window state.
+SYSTEM_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "volume",
+            "description": (
+                "Tizim ovoz balandligini boshqarish. "
+                "action: get (o'qish), set (aniq foizga: percent), "
+                "adjust (nisbiy: delta, masalan +30 yoki -10), "
+                "mute / unmute."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["get", "set", "adjust", "mute", "unmute"]},
+                    "percent": {"type": "number", "description": "set uchun: 0-100"},
+                    "delta": {"type": "number", "description": "adjust uchun: masalan 30 yoki -10"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "window_state",
+            "description": (
+                "Oynani kattalashtirish/kichiklashtirish/tiklash. "
+                "read_window yoki list_windows bergan handle kerak."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "handle": {"type": "integer"},
+                    "state": {"type": "string", "enum": ["maximize", "minimize", "normal"]},
+                },
+                "required": ["handle", "state"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "window_focus",
+            "description": "Oynani old tomonga chiqarish (fokus berish).",
+            "parameters": {
+                "type": "object",
+                "properties": {"handle": {"type": "integer"}},
+                "required": ["handle"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "window_close",
+            "description": "Oynani yopish. Foydalanuvchidan tasdiq so'raladi.",
+            "parameters": {
+                "type": "object",
+                "properties": {"handle": {"type": "integer"}},
+                "required": ["handle"],
+            },
+        },
+    },
+]
+
 # Tools that are proposed to the user and executed only after an explicit tap.
 # ui_click is conditional: only an irreversible-looking label is confirmed, so
 # ordinary navigation stays fluid.
-_CONFIRM_TOOLS = {"sheet_write", "ui_click", "web_click"}
+_CONFIRM_TOOLS = {"sheet_write", "ui_click", "web_click", "window_close"}
 
 
 def tools_for(caps: list[str]) -> list[dict]:
@@ -487,7 +554,7 @@ def tools_for(caps: list[str]) -> list[dict]:
     """
     from .config import (
         CAP_BROWSER, CAP_DESKTOP, CAP_DESKTOP_CONTROL, CAP_OFFICE,
-        CAP_OFFICE_WRITE,
+        CAP_OFFICE_WRITE, CAP_SYSTEM,
     )
 
     out = list(TOOLS)
@@ -503,6 +570,8 @@ def tools_for(caps: list[str]) -> list[dict]:
         out += CONTROL_TOOLS
     if CAP_BROWSER in caps:
         out += BROWSER_TOOLS
+    if CAP_SYSTEM in caps:
+        out += SYSTEM_TOOLS
     return out
 
 
@@ -512,6 +581,16 @@ class Brain:
         self.llm = llm
         self._send_file = send_file
         self._notify = notify or (lambda _m: None)
+
+        # Pre-generate the comtypes wrappers on this thread, before any worker
+        # thread can race the lazy codegen and segfault the process. Cheap and
+        # a no-op off Windows or when the libraries are absent.
+        try:
+            from . import uia
+
+            uia.warmup()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ entry
 
@@ -677,6 +756,10 @@ class Brain:
             web_result = await self._run_browser(name, args)
             if web_result is not None:
                 return web_result
+
+            system_result = await self._run_system(name, args)
+            if system_result is not None:
+                return system_result
 
             if name == "find_files":
                 root = args.get("root")
@@ -885,6 +968,52 @@ class Brain:
             self._sendable.add(os.path.normcase(result["path"]))
         return result
 
+    async def _run_system(self, name: str, args: dict) -> ToolResult | None:
+        """Volume and window state. Returns None if not a system tool."""
+        from .config import CAP_SYSTEM
+
+        if name not in {"volume", "window_state", "window_focus", "window_close"}:
+            return None
+        if CAP_SYSTEM not in self._caps:
+            return self._denied(CAP_SYSTEM)
+
+        loop = asyncio.get_running_loop()
+
+        if name == "volume":
+            from . import system
+
+            action = str(args.get("action", "get"))
+            if action == "get":
+                return await loop.run_in_executor(None, system.get_volume)
+            if action == "set":
+                return await loop.run_in_executor(
+                    None, lambda: system.set_volume(float(args.get("percent", 50)))
+                )
+            if action == "adjust":
+                return await loop.run_in_executor(
+                    None, lambda: system.adjust_volume(float(args.get("delta", 0)))
+                )
+            if action in ("mute", "unmute"):
+                return await loop.run_in_executor(
+                    None, lambda: system.set_mute(action == "mute")
+                )
+            return {"error": f"Noma'lum ovoz amali: {action}"}
+
+        from . import uia
+
+        handle = int(args.get("handle", 0))
+        if name == "window_focus":
+            return await loop.run_in_executor(None, lambda: uia.focus_window(handle))
+        if name == "window_state":
+            from .system import STATE_NAMES, WV_NORMAL
+
+            state = STATE_NAMES.get(str(args.get("state", "normal")).lower(), WV_NORMAL)
+            return await loop.run_in_executor(
+                None, lambda: uia.set_window_state(handle, state)
+            )
+        # window_close is in _CONFIRM_TOOLS and never reaches here directly.
+        return {"error": "window_close tasdiq orqali bajariladi"}
+
     def _describe_action(self, name: str, args: dict) -> dict:
         """Plain-language summary of a destructive action, for the user to approve.
 
@@ -892,7 +1021,23 @@ class Brain:
         run - the user asked to be asked about dangerous things, not about
         every click.
         """
-        from .config import CAP_BROWSER, CAP_DESKTOP_CONTROL, CAP_OFFICE_WRITE
+        from .config import (
+            CAP_BROWSER, CAP_DESKTOP_CONTROL, CAP_OFFICE_WRITE, CAP_SYSTEM,
+        )
+
+        if name == "window_close":
+            if CAP_SYSTEM not in self._caps:
+                return self._denied(CAP_SYSTEM)
+            from . import uia
+
+            info = uia.window_by_handle(int(args.get("handle", 0)))
+            if info is None:
+                return {"error": "Oyna topilmadi (yopilgan bo'lishi mumkin)."}
+            return {"summary": (
+                f"⚠️ Oynani yopmoqchiman:\n"
+                f"🪟 {info['title']}\n\n"
+                "Saqlanmagan ma'lumot yo'qolishi mumkin. Davom etaymi?"
+            )}
 
         if name == "web_click":
             if CAP_BROWSER not in self._caps:
@@ -958,6 +1103,20 @@ class Brain:
         args = action.get("args") or {}
         if name not in _CONFIRM_TOOLS:
             return "❌ Noma'lum amal."
+
+        if name == "window_close":
+            gate = self._describe_action(name, args)
+            if gate.get("error"):
+                return f"❌ {gate['error']}"
+            from . import uia
+
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None, lambda: uia.close_window(int(args.get("handle", 0)))
+            )
+            if not result.get("ok"):
+                return f"❌ {result.get('error', 'Bajarilmadi')}"
+            return f"✅ Yopildi: {result.get('closed')}"
 
         if name in ("ui_click", "web_click"):
             gate = self._describe_action(name, args)
@@ -1110,6 +1269,20 @@ class Brain:
                 "- Rasm kerak bo'lsa: `web_screenshot` → `send_file`."
             )
 
+        from .config import CAP_SYSTEM as _CS
+
+        if _CS in self._caps:
+            parts.append(
+                "TIZIM:\n"
+                "- Ovoz: `volume` (get/set/adjust/mute). «30% balandroq» → "
+                "adjust delta=30. «ovozni 50 qil» → set percent=50.\n"
+                "- Oyna: `window_state` (maximize/minimize/normal), "
+                "`window_focus`, `window_close`. Handle'ni `list_windows` yoki "
+                "`read_window` beradi.\n"
+                "- «brauzer to'liq ko'rinsin» = brauzer OYNASINI maximize qil "
+                "(bu web to'liq ekran EMAS). Avval list_windows bilan handle ol."
+            )
+
         locked = self._locked_note()
         if locked:
             parts.append(locked)
@@ -1129,7 +1302,7 @@ class Brain:
         """
         from .config import (
             CAP_BROWSER, CAP_DESKTOP, CAP_DESKTOP_CONTROL, CAP_LABELS,
-            CAP_OFFICE, CAP_OFFICE_WRITE,
+            CAP_OFFICE, CAP_OFFICE_WRITE, CAP_SYSTEM,
         )
 
         examples = {
@@ -1138,6 +1311,7 @@ class Brain:
             CAP_DESKTOP: "ochiq dastur oynalarini ko'rish",
             CAP_DESKTOP_CONTROL: "oynadagi tugmalarni bosish, maydonga yozish",
             CAP_BROWSER: "brauzerda sayt ochish, forma to'ldirish, sahifa o'qish",
+            CAP_SYSTEM: "ovoz balandligini o'zgartirish, oynani katta/kichik qilish",
         }
         missing = [c for c in examples if c not in self._caps]
         if not missing:

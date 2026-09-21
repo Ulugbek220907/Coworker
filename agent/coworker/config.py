@@ -74,10 +74,11 @@ CAP_OFFICE_WRITE = "office_write"   # modify a document - always confirmed
 CAP_DESKTOP = "desktop"             # read open windows as a text tree
 CAP_DESKTOP_CONTROL = "desktop_control"   # click and type into them
 CAP_BROWSER = "browser"             # open and drive web pages
+CAP_SYSTEM = "system"               # master volume and window state
 
 ALL_CAPS = (
     CAP_FIND, CAP_OFFICE, CAP_OFFICE_WRITE,
-    CAP_DESKTOP, CAP_DESKTOP_CONTROL, CAP_BROWSER,
+    CAP_DESKTOP, CAP_DESKTOP_CONTROL, CAP_BROWSER, CAP_SYSTEM,
 )
 
 CAP_LABELS = {
@@ -87,6 +88,7 @@ CAP_LABELS = {
     CAP_DESKTOP: "Ochiq oynalarni ko'rish",
     CAP_DESKTOP_CONTROL: "Oynalarni boshqarish (bosish, yozish)",
     CAP_BROWSER: "Brauzer: sayt ochish va to'ldirish",
+    CAP_SYSTEM: "Ovoz va oyna holatini boshqarish",
 }
 
 

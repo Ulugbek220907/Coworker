@@ -113,6 +113,7 @@ class _State:
     playwright: Any = None
     context: Any = None
     page: Any = None
+    channel: str = ""
     elements: list[dict] = field(default_factory=list)
 
 
@@ -132,6 +133,14 @@ def _profile_dir():
 # flip it for a machine nobody is sitting at.
 HEADLESS = False
 
+# Prefer the real Chrome install over Playwright's bundled Chromium. The
+# bundled build is "Chrome for Testing" - it renders and networks slightly
+# differently, has no extensions, and here it could not reach eclass.uz at
+# all. channel="chrome" drives the actual Google Chrome on the machine, so
+# pages behave the way the user expects. Falls back to bundled Chromium when
+# no real Chrome is installed.
+CHANNEL = "chrome"
+
 
 def _ensure_page(headless: bool | None = None):
     """One browser, one page, reused across calls."""
@@ -144,12 +153,23 @@ def _ensure_page(headless: bool | None = None):
     if _state.playwright is None:
         _state.playwright = sync_playwright().start()
 
-    _state.context = _state.playwright.chromium.launch_persistent_context(
+    common = dict(
         user_data_dir=str(_profile_dir()),
         headless=headless,
         viewport={"width": 1280, "height": 900},
         args=["--disable-blink-features=AutomationControlled"],
     )
+    try:
+        _state.context = _state.playwright.chromium.launch_persistent_context(
+            channel=CHANNEL, **common
+        )
+        _state.channel = CHANNEL
+    except Exception as exc:
+        # No real Chrome, or the channel is unavailable: use bundled Chromium.
+        log.info("channel %r unavailable (%s); using bundled Chromium", CHANNEL, exc)
+        _state.context = _state.playwright.chromium.launch_persistent_context(**common)
+        _state.channel = "chromium"
+
     _state.context.set_default_timeout(NAV_TIMEOUT)
     _state.page = _state.context.pages[0] if _state.context.pages else _state.context.new_page()
     return _state.page

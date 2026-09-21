@@ -15,6 +15,9 @@ openpyxl>=3.1
 # no screenshots, no GPU.
 uiautomation>=2.0; sys_platform == 'win32'
 
+# System volume control (window state reuses uiautomation above).
+pycaw>=20240210; sys_platform == 'win32'
+
 # Browser control. A page already knows its own structure, so reading the
 # DOM beats reading a picture of it. After installing, fetch the browser:
 #     playwright install chromium

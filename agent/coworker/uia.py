@@ -82,6 +82,39 @@ def available() -> bool:
     return bool(importlib.util.find_spec("uiautomation"))
 
 
+_warmed = False
+
+
+def warmup() -> None:
+    """Generate the comtypes wrappers on the main thread, once, at startup.
+
+    comtypes builds its type-library wrappers lazily and that codegen is not
+    thread-safe. When a UIA call and a pycaw (audio) call first trigger it from
+    different worker threads, the process segfaults - reproduced here the
+    moment a window read followed a volume change under the async agent. Doing
+    it up front, single-threaded, removes the lazy generation entirely so no
+    two threads ever race it.
+    """
+    global _warmed
+    if _warmed or os.name != "nt":
+        return
+    _warmed = True
+    # Import order and COM state both matter. uiautomation must be fully
+    # imported BEFORE pycaw creates any audio COM object, and - the subtle part
+    # - it must be imported while COM is still UNINITIALISED on this thread.
+    # Importing it after a CoInitialize() leaves a leftover pycaw endpoint to be
+    # finalized during a later lazy `import uiautomation`, and that Release()
+    # segfaults. So: no CoInitialize here, uiautomation first, pycaw second.
+    try:
+        import uiautomation  # noqa: F401
+    except Exception as exc:
+        log.info("warmup: uiautomation unavailable: %s", exc)
+    try:
+        from pycaw.pycaw import IAudioEndpointVolume, IMMDeviceEnumerator  # noqa: F401
+    except Exception:
+        pass  # audio is optional
+
+
 def status() -> str:
     if not available():
         return "o'rnatilmagan — pip install uiautomation"
@@ -449,6 +482,107 @@ def _act(handle: int, ref: int, action) -> dict:
         return _worker.call(job, timeout=CALL_TIMEOUT)
     except TimeoutError:
         return {"error": "Amal javob bermadi."}
+    except Exception as exc:
+        return {"error": f"Xato: {exc}"}
+
+
+def set_window_state(handle: int, state: int) -> dict:
+    """Maximize / minimize / restore a window by handle.
+
+    Uses WindowPattern.SetWindowVisualState, which was verified to move a real
+    window between states and back. No mouse, no title-bar hunting.
+    """
+    if not available():
+        return {"error": status()}
+
+    def job():
+        import uiautomation as auto
+
+        auto.SetGlobalSearchTimeout(1)
+        win = _locate(auto, "", handle)
+        if win is None:
+            return {"error": "Oyna topilmadi."}
+        try:
+            win.GetWindowPattern().SetWindowVisualState(state)
+            return {"ok": True, "window": _clean(win.Name)[:60], "state": state}
+        except Exception as exc:
+            return {"error": f"Oyna holatini o'zgartirib bo'lmadi: {exc}"}
+
+    return _window_call(job)
+
+
+def focus_window(handle: int) -> dict:
+    """Bring a window to the front."""
+    if not available():
+        return {"error": status()}
+
+    def job():
+        import uiautomation as auto
+
+        auto.SetGlobalSearchTimeout(1)
+        win = _locate(auto, "", handle)
+        if win is None:
+            return {"error": "Oyna topilmadi."}
+        try:
+            state = win.GetWindowPattern().WindowVisualState
+            if state == 2:                       # minimized -> restore first
+                win.GetWindowPattern().SetWindowVisualState(0)
+            win.SetFocus()
+            return {"ok": True, "window": _clean(win.Name)[:60]}
+        except Exception as exc:
+            return {"error": f"Fokusni o'tkazib bo'lmadi: {exc}"}
+
+    return _window_call(job)
+
+
+def close_window(handle: int) -> dict:
+    """Close a window. Irreversible - the caller must confirm first."""
+    if not available():
+        return {"error": status()}
+
+    def job():
+        import uiautomation as auto
+
+        auto.SetGlobalSearchTimeout(1)
+        win = _locate(auto, "", handle)
+        if win is None:
+            return {"error": "Oyna topilmadi (yopilgan bo'lishi mumkin)."}
+        name = _clean(win.Name)[:60]
+        try:
+            win.GetWindowPattern().Close()
+            return {"ok": True, "closed": name}
+        except Exception as exc:
+            return {"error": f"Oynani yopib bo'lmadi: {exc}"}
+
+    return _window_call(job)
+
+
+def window_by_handle(handle: int) -> dict | None:
+    """Look up a window's title/state for the confirmation prompt."""
+    def job():
+        import uiautomation as auto
+
+        auto.SetGlobalSearchTimeout(1)
+        win = _locate(auto, "", handle)
+        if win is None:
+            return None
+        try:
+            return {"title": _clean(win.Name)[:70],
+                    "state": win.GetWindowPattern().WindowVisualState}
+        except Exception:
+            return {"title": _clean(win.Name)[:70], "state": 0}
+
+    try:
+        return _worker.call(job, timeout=15)
+    except Exception:
+        return None
+
+
+def _window_call(job) -> dict:
+    try:
+        return _worker.call(job, timeout=CALL_TIMEOUT)
+    except TimeoutError:
+        return {"error": "Oyna javob bermadi."}
     except Exception as exc:
         return {"error": f"Xato: {exc}"}
 
