@@ -57,6 +57,41 @@ def available() -> bool:
     return bool(importlib.util.find_spec("playwright"))
 
 
+# Which browser to drive:
+#   "profile" - a dedicated Chrome profile of our own (default). The user logs
+#               into sites once in the agent's window; nothing of theirs is
+#               touched. This is what launch_persistent_context uses.
+#   "cdp"     - the user's OWN Chrome, with their real logged-in accounts. The
+#               agent launches their Chrome with a remote-debugging port and
+#               their real profile, then attaches over CDP. Requires their
+#               normal Chrome to be closed first (Chrome is single-instance per
+#               profile, so a running copy would swallow the launch and never
+#               expose the port).
+MODE = "profile"
+CDP_PORT = 9222
+CHROME_USER_DATA = ""      # "" -> auto-detect the real Chrome "User Data"
+CHROME_PROFILE = "Default"
+
+
+def _chrome_exe() -> str:
+    import os
+    import shutil
+
+    for var in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"):
+        p = os.path.join(os.environ.get(var, ""), "Google", "Chrome", "Application", "chrome.exe")
+        if os.path.isfile(p):
+            return p
+    return shutil.which("chrome") or ""
+
+
+def _real_user_data() -> str:
+    import os
+
+    if CHROME_USER_DATA:
+        return CHROME_USER_DATA
+    return os.path.join(os.environ.get("LOCALAPPDATA", ""), "Google", "Chrome", "User Data")
+
+
 def status() -> str:
     if not available():
         return "o'rnatilmagan — pip install playwright && playwright install chromium"
@@ -111,9 +146,12 @@ _worker = _Worker()
 @dataclass
 class _State:
     playwright: Any = None
+    browser: Any = None       # the connected Browser in CDP mode
     context: Any = None
     page: Any = None
     channel: str = ""
+    mode: str = ""
+    cdp_proc: Any = None      # the Chrome we launched, if any
     elements: list[dict] = field(default_factory=list)
 
 
@@ -144,7 +182,6 @@ CHANNEL = "chrome"
 
 def _ensure_page(headless: bool | None = None):
     """One browser, one page, reused across calls."""
-    headless = HEADLESS if headless is None else headless
     if _state.page is not None and not _state.page.is_closed():
         return _state.page
 
@@ -153,6 +190,13 @@ def _ensure_page(headless: bool | None = None):
     if _state.playwright is None:
         _state.playwright = sync_playwright().start()
 
+    if MODE == "cdp":
+        return _ensure_page_cdp()
+    return _ensure_page_profile(HEADLESS if headless is None else headless)
+
+
+def _ensure_page_profile(headless: bool):
+    """Our own dedicated Chrome profile."""
     common = dict(
         user_data_dir=str(_profile_dir()),
         headless=headless,
@@ -165,25 +209,100 @@ def _ensure_page(headless: bool | None = None):
         )
         _state.channel = CHANNEL
     except Exception as exc:
-        # No real Chrome, or the channel is unavailable: use bundled Chromium.
         log.info("channel %r unavailable (%s); using bundled Chromium", CHANNEL, exc)
         _state.context = _state.playwright.chromium.launch_persistent_context(**common)
         _state.channel = "chromium"
 
+    _state.mode = "profile"
     _state.context.set_default_timeout(NAV_TIMEOUT)
     _state.page = _state.context.pages[0] if _state.context.pages else _state.context.new_page()
     return _state.page
 
 
+def _ensure_page_cdp():
+    """Attach to the user's own Chrome, with their real logged-in accounts.
+
+    If a debuggable Chrome is already listening, reuse it. Otherwise launch the
+    real Chrome against the user's real profile with the debugging port, and
+    wait for it. If a normal Chrome is already holding that profile, the launch
+    cannot expose the port - Chrome is single-instance per profile - so this
+    raises with a message telling the user to close Chrome first, rather than
+    silently falling back to a profile that has none of their accounts.
+    """
+    import socket
+
+    endpoint = f"http://127.0.0.1:{CDP_PORT}"
+
+    def _up() -> bool:
+        s = socket.socket()
+        s.settimeout(0.3)
+        try:
+            s.connect(("127.0.0.1", CDP_PORT))
+            return True
+        except Exception:
+            return False
+        finally:
+            s.close()
+
+    if not _up():
+        exe = _chrome_exe()
+        if not exe:
+            raise RuntimeError("Google Chrome topilmadi.")
+        import subprocess
+        import time
+
+        _state.cdp_proc = subprocess.Popen(
+            [exe, f"--remote-debugging-port={CDP_PORT}",
+             f"--user-data-dir={_real_user_data()}",
+             f"--profile-directory={CHROME_PROFILE}",
+             "--no-first-run", "--no-default-browser-check"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        )
+        deadline = time.monotonic() + 12
+        while time.monotonic() < deadline and not _up():
+            time.sleep(0.3)
+        if not _up():
+            raise RuntimeError(
+                "Chrome debug rejimida ochilmadi. Odatdagi Chrome ochiq bo'lsa, "
+                "avval uni butunlay yoping (barcha oynalar) — keyin men uni "
+                "sizning akkauntlaringiz bilan qayta ochaman."
+            )
+
+    browser = _state.playwright.chromium.connect_over_cdp(endpoint)
+    _state.browser = browser
+    _state.context = browser.contexts[0] if browser.contexts else browser.new_context()
+    _state.context.set_default_timeout(NAV_TIMEOUT)
+    _state.mode = "cdp"
+    _state.channel = "chrome-cdp"
+    # A fresh tab of our own, so the agent never navigates away from whatever
+    # the user is looking at. It still carries their cookies and logins.
+    _state.page = _state.context.new_page()
+    return _state.page
+
+
 def close() -> dict:
     def job():
-        for obj, method in ((_state.context, "close"), (_state.playwright, "stop")):
-            if obj is not None:
-                try:
-                    getattr(obj, method)()
-                except Exception:
-                    pass
-        _state.playwright = _state.context = _state.page = None
+        if _state.mode == "cdp":
+            # Their Chrome is theirs and they are using it - disconnect, never
+            # kill it, and leave the process we launched running.
+            try:
+                if _state.browser is not None:
+                    _state.browser.close()      # closes the CDP connection only
+            except Exception:
+                pass
+        else:
+            try:
+                if _state.context is not None:
+                    _state.context.close()
+            except Exception:
+                pass
+        try:
+            if _state.playwright is not None:
+                _state.playwright.stop()
+        except Exception:
+            pass
+        _state.playwright = _state.browser = _state.context = _state.page = None
+        _state.mode = ""
         _state.elements = []
         return {"ok": True}
 

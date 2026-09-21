@@ -50,6 +50,11 @@ DEFAULTS: dict[str, Any] = {
     # Browser. Headless hides the window; visible is the default so the
     # user can sign in to sites once and watch what the agent does.
     "browser_headless": False,
+    # "profile" = agent's own Chrome profile (sign in once).
+    # "cdp"     = attach to the user's real Chrome with their accounts.
+    "browser_mode": "profile",
+    "browser_cdp_port": 9222,
+    "chrome_profile": "Default",
 
     # Speech to text
     "stt_enabled": True,

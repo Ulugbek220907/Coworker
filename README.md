@@ -325,8 +325,16 @@ haqiqiy Google Chrome**'ni ishlatadi (`channel="chrome"`). Bu eclass.uz kabi
 saytlar ochilmagan muammoni hal qiladi — render va tarmoq odatdagi Chrome
 bilan bir xil. Chrome yo'q bo'lsa, Playwright'ning Chromium'iga qaytadi.
 
-> Bu **alohida profil** — sizning kundalik Chrome akkauntlaringiz emas.
-> Kerakli saytlarga agent oynasida bir marta kirasiz, sessiya saqlanadi.
+### Ikki rejim
+
+Sozlamalarda brauzer rejimini tanlaysiz:
+
+| Rejim | Nima |
+|---|---|
+| `profile` | Agent'ning alohida Chrome profili. Saytlarga bir marta kirasiz, sessiya saqlanadi. Kundalik Chrome'ingizga tegilmaydi. |
+| `cdp` | Sizning **haqiqiy Chrome'ingiz** — kirgan akkauntlaringiz bilan. Agent Chrome'ni debug portida sizning profilingiz bilan ochadi va ulanadi. |
+
+> `cdp` rejimida odatdagi Chrome **yopiq** bo'lishi kerak (Chrome bitta profilga bitta nusxa) — agent uni o'zi akkauntlaringiz bilan qayta ochadi. Ochiq bo'lsa, agent buni aniqlab, «avval Chrome'ni yoping» deydi. Agent Chrome'ingizni **hech qachon o'zi yopmaydi** — faqat ulanishni uzadi.
 
 ## Xavfsizlik
 

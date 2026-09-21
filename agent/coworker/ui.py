@@ -254,6 +254,19 @@ class AgentWindow:
         self.stt_status = tk.Label(srow, text="", bg=BG, fg=MUTED, font=("Segoe UI", 8))
         self.stt_status.pack(side="left", padx=10)
 
+        tk.Label(body, text="BRAUZER", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(16, 4))
+        brow = tk.Frame(body, bg=BG)
+        brow.pack(fill="x", pady=2)
+        self.browser_mode = tk.StringVar(value=self.cfg.get("browser_mode", "profile"))
+        ttk.Combobox(brow, values=["profile", "cdp"], textvariable=self.browser_mode,
+                     state="readonly", width=16).pack(side="left")
+        tk.Label(brow, text="profile = alohida | cdp = mening Chrome'im (akkauntlar bilan)",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(side="left", padx=10)
+        tk.Label(body, text="cdp: odatdagi Chrome yopiq bo'lishi kerak — agent uni "
+                 "akkauntlaringiz bilan qayta ochadi.",
+                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 0))
+
         tk.Label(body, text="ISHGA TUSHISH", bg=BG, fg=MUTED,
                  font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(16, 4))
         self.autostart = tk.BooleanVar(value=tray_mod.autostart_enabled())
@@ -320,6 +333,7 @@ class AgentWindow:
         self.cfg.set("roots", roots)
         self.cfg.set("stt_enabled", bool(self.stt_on.get()))
         self.cfg.set("stt_engine", self.stt_engine.get())
+        self.cfg.set("browser_mode", self.browser_mode.get())
         self._log("Sozlamalar saqlandi. Ilovani qayta ishga tushiring.")
         messagebox.showinfo("Coworker", "Saqlandi.\nO'zgarishlar uchun ilovani qayta oching.")
 
