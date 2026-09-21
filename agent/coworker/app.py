@@ -26,6 +26,16 @@ MAX_PAIR_ATTEMPTS = 5
 PAIR_LOCKOUT = 600.0
 
 
+def _is_shutdown(exc: BaseException) -> bool:
+    """Is this the "interpreter already shutting down" RuntimeError?
+
+    asyncio resolves DNS through the default executor, so once that executor is
+    closed even an outgoing HTTP request fails this way - it is not a bug in
+    the request, it means the process is on its way out.
+    """
+    return "cannot schedule new futures" in str(exc).lower()
+
+
 class CoworkerAgent:
     def __init__(self, cfg: Config, status: Callable[[str, str], None] | None = None) -> None:
         self.cfg = cfg
@@ -296,6 +306,17 @@ class CoworkerAgent:
             try:
                 mem = self.memory.get(chat_id)
                 payload = await self.brain.handle(mem, text, self.cfg.caps(chat_id))
+            except RuntimeError as exc:
+                if _is_shutdown(exc):
+                    # The interpreter is going down but this thread is still
+                    # connected. Answering is impossible and every further
+                    # message would echo the same internal error, so go quiet
+                    # and drop the link instead of pretending to be alive.
+                    log.warning("shutting down mid-request; disconnecting")
+                    asyncio.create_task(self.link.stop())
+                    return
+                log.exception("think failed")
+                payload = {"text": f"⚠️ Xato: {str(exc)[:150]}"}
             except Exception as exc:
                 log.exception("think failed")
                 payload = {"text": f"⚠️ Xato: {str(exc)[:150]}"}

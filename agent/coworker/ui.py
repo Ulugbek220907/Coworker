@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import queue
+import signal
 import threading
 import time
 import tkinter as tk
@@ -434,9 +435,26 @@ class AgentWindow:
         if not self.has_tray:
             self._log("Tray ishlamadi — oyna yopilsa ilova to'xtaydi. "
                       "Tuzatish: pip install pystray pillow")
+        # Ctrl+C that lands while Tk is running a callback gets swallowed -
+        # Tk prints "Exception in Tkinter callback" and carries on - so relying
+        # on KeyboardInterrupt alone can still leave a half-dead app. Handle
+        # the signal directly and quit for real.
+        try:
+            signal.signal(signal.SIGINT, lambda *_: self._hard_exit())
+        except (ValueError, OSError):
+            pass  # not the main thread, or no signal support
+
         self.root.after(600, self._show_stt_status)
-        self.root.mainloop()
-        self._hard_exit()
+        try:
+            self.root.mainloop()
+        finally:
+            # Ctrl+C in the launching terminal raises out of mainloop. Without
+            # the finally the exit path was skipped entirely, and the process
+            # lived on: interpreter shutdown had already disabled the default
+            # executor, yet the agent thread stayed connected and answered
+            # Telegram with "cannot schedule new futures after shutdown" for
+            # every message. Quitting has to be unconditional.
+            self._hard_exit()
 
     def _hard_exit(self) -> None:
         """pystray runs its backend on non-daemon threads, so returning from

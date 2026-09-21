@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -50,6 +51,14 @@ def main() -> None:
         # Ctrl+C in the launching terminal is a normal way to stop this,
         # not a crash - a traceback here just looks like a bug.
         print("\n  Coworker to'xtatildi.")
+    finally:
+        # Backstop. Returning normally is not enough to end the process: tray
+        # and COM worker threads can hold it open, and once the interpreter has
+        # begun shutting down the default executor is dead, so a surviving
+        # agent answers every Telegram message with an internal error instead
+        # of going quiet. Whatever happens above, this process ends here.
+        sys.stdout.flush()
+        os._exit(0)
 
 
 if __name__ == "__main__":
