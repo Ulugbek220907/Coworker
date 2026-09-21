@@ -336,6 +336,26 @@ Sozlamalarda brauzer rejimini tanlaysiz:
 
 > `cdp` rejimida odatdagi Chrome **yopiq** bo'lishi kerak (Chrome bitta profilga bitta nusxa) — agent uni o'zi akkauntlaringiz bilan qayta ochadi. Ochiq bo'lsa, agent buni aniqlab, «avval Chrome'ni yoping» deydi. Agent Chrome'ingizni **hech qachon o'zi yopmaydi** — faqat ulanishni uzadi.
 
+## Ekranni o'qish (vision — 3-bosqich)
+
+UIA daraxti Electron, o'yin, video va canvas ilovalarni bo'sh qaytaradi.
+Bunday ekranlar uchun `screen_read`: skrinshotni **deepseek-flash** vision
+modeliga yuborib, savolga javob beradi.
+
+```
+  u: VS Code'da qanaqa xatolik chiqib turibdi?
+ AI: 📄 Pastdagi panelda "ModuleNotFoundError: pandas" xatosi ko'rinyapti...
+```
+
+**Ataylab faqat O'QISH.** Tekshirib ko'rdim: deepseek-flash ekranni aniq
+tasvirlaydi (masalan, ochiq dasturlar va matnni to'g'ri o'qidi), lekin aniq
+piksel **koordinata** berishda ishonchsiz — Login tugmasini so'raganda Cancel
+joyini ko'rsatdi. Shuning uchun vision bilan bosish yo'q: u faqat o'qiydi.
+Bosish uchun UIA (aniq) yoki brauzer (DOM) ishlatiladi.
+
+> Skrinshot faqat siz ekranni o'qishni so'raganda olinadi — uzluksiz emas.
+> Ekran matni ham begona kontent: ma'lumot, ko'rsatma emas.
+
 ## Xavfsizlik
 
 - **Faqat ulangan chatlar.** Kod noutbuk ekranida ko'rinadi va bir martalik.

@@ -26,7 +26,7 @@ MAX_STEPS = 9  # tool rounds before we force an answer
 
 # Tools whose output is attacker-influenced: the bytes come from a file
 # somebody else may have authored and sent to the user.
-CONTENT_TOOLS = {"preview_file", "search_in_files", "web_read"}
+CONTENT_TOOLS = {"preview_file", "search_in_files", "web_read", "screen_read"}
 
 SYSTEM = """Sen "Coworker" — foydalanuvchining shaxsiy kompyuteridagi hujjatlarni topib beradigan yordamchisan.
 Foydalanuvchi uyda qolgan noutbukdan fayl so'rayapti. U Telegramda yozadi.
@@ -357,6 +357,26 @@ DESKTOP_TOOLS = [
                     "title": {"type": "string", "description": "Oyna sarlavhasining bir qismi"},
                 },
                 "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "screen_read",
+            "description": (
+                "Ekranni RASM sifatida ko'rib, savolga javob berish. "
+                "read_window bo'sh qaytarsa (Electron, o'yin, video, canvas "
+                "ilovalar) shuni ishlat — matn, xatolik, holatni o'qiy oladi. "
+                "MUHIM: aniq koordinata bera olmaydi, faqat o'qiydi."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "Nima aniqlash kerak"},
+                    "title": {"type": "string", "description": "Ixtiyoriy: aniq oyna. Bo'sh = butun ekran"},
+                },
+                "required": ["question"],
             },
         },
     },
@@ -907,7 +927,7 @@ class Brain:
         """Screen reading and control. Returns None if not a desktop tool."""
         from .config import CAP_DESKTOP, CAP_DESKTOP_CONTROL
 
-        if name not in {"list_windows", "read_window", "ui_click", "ui_type"}:
+        if name not in {"list_windows", "read_window", "screen_read", "ui_click", "ui_type"}:
             return None
         if CAP_DESKTOP not in self._caps:
             return self._denied(CAP_DESKTOP)
@@ -920,6 +940,10 @@ class Brain:
         if name == "read_window":
             title = str(args.get("title", ""))
             return await loop.run_in_executor(None, lambda: uia.read_window(title))
+        if name == "screen_read":
+            return await self._screen_read(
+                str(args.get("question", "")), str(args.get("title", ""))
+            )
 
         if CAP_DESKTOP_CONTROL not in self._caps:
             return self._denied(CAP_DESKTOP_CONTROL)
@@ -1016,6 +1040,26 @@ class Brain:
             )
         # window_close is in _CONFIRM_TOOLS and never reaches here directly.
         return {"error": "window_close tasdiq orqali bajariladi"}
+
+    async def _screen_read(self, question: str, title: str) -> ToolResult:
+        """Capture the screen (or a window) and ask the vision model about it."""
+        from . import vision
+
+        if not vision.available():
+            return {"error": vision.status()}
+
+        loop = asyncio.get_running_loop()
+        shot = await loop.run_in_executor(None, lambda: vision.capture(title))
+        if shot.get("error"):
+            return shot
+
+        prompt = f"{vision.DEFAULT_PROMPT}\n\nSAVOL: {question or 'Ekranda nima bor?'}"
+        model = str(self.cfg.get("vision_model", "deepseek-flash"))
+        try:
+            answer = await self.llm.vision(prompt, shot["image_b64"], model=model)
+        except LLMError as exc:
+            return {"error": f"Vision model xatosi: {exc}"}
+        return {"scope": shot["scope"], "answer": answer}
 
     def _describe_action(self, name: str, args: dict) -> dict:
         """Plain-language summary of a destructive action, for the user to approve.
@@ -1250,9 +1294,11 @@ class Brain:
                 "- `read_window` har bir elementga raqam beradi. Bosishdan oldin\n"
                 "  ALBATTA o'qi — raqamni o'zingdan to'qima.\n"
                 "- Oyna o'zgargan bo'lsa (yangi bet, dialog ochildi) — qayta o'qi.\n"
-                "- Element ro'yxati bo'sh kelsa: bu Electron ilova (VS Code, Discord,\n"
-                "  Claude) bo'lishi mumkin — ularda accessibility o'chiq. Shuni ayt,\n"
-                "  taxmin qilib bosma."
+                "- Element ro'yxati bo'sh kelsa: bu Electron/canvas ilova (VS Code,\n"
+                "  Discord, o'yin, video) — `read_window` ularni o'qiy olmaydi.\n"
+                "  Unda `screen_read` ishlat: ekranni RASM sifatida ko'rib javob\n"
+                "  beradi (matn, xatolik, holat). Lekin aniq koordinata BERMAYDI —\n"
+                "  bosish uchun emas, faqat o'qish uchun."
                 + ("\n- O'chirish/yuborish kabi tugmalarda tizim tasdiq so'raydi —\n"
                    "  sen qo'shimcha so'rama, to'g'ridan-to'g'ri chaqir."
                    if _CDC in self._caps else "")

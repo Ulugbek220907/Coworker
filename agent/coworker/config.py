@@ -55,6 +55,9 @@ DEFAULTS: dict[str, Any] = {
     "browser_mode": "profile",
     "browser_cdp_port": 9222,
     "chrome_profile": "Default",
+    # Vision model for reading screens (screen_read). deepseek-flash sees
+    # images well; it is only used when a screen is explicitly read.
+    "vision_model": "deepseek-flash",
 
     # Speech to text
     "stt_enabled": True,

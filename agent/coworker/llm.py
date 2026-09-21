@@ -115,6 +115,51 @@ class LLM:
 
         raise LLMError(last_error or "noma'lum xato")
 
+    async def vision(
+        self,
+        prompt: str,
+        image_b64: str,
+        *,
+        model: str,
+        max_tokens: int = 500,
+    ) -> str:
+        """One image + prompt call, against a vision-capable model.
+
+        A reasoning model (deepseek-flash) sometimes leaves `content` empty and
+        puts its answer in `reasoning_content`, so fall back to that rather than
+        returning nothing.
+        """
+        payload = {
+            "model": model,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url",
+                     "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+                ],
+            }],
+            "max_tokens": max_tokens,
+            "temperature": 0.1,
+        }
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        r = await self._client.post(
+            f"{self.base_url}/chat/completions", json=payload, headers=headers
+        )
+        if r.status_code != 200:
+            raise LLMError(_describe(r))
+        choices = r.json().get("choices") or []
+        if not choices:
+            raise LLMError("vision javobi bo'sh")
+        msg = choices[0].get("message", {})
+        text = (msg.get("content") or "").strip()
+        if not text:
+            text = (msg.get("reasoning_content") or "").strip()
+        return text or "(bo'sh javob)"
+
     async def ping(self) -> tuple[bool, str]:
         """Used by the settings window's Test button."""
         try:
