@@ -419,6 +419,59 @@ CONTROL_TOOLS = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "key_press",
+            "description": (
+                "Klaviatura kombinatsiyasini yuborish: «ctrl+s», «alt+tab», "
+                "«enter», «f5», «ctrl+shift+n». `handle` bering — oyna oldinga "
+                "chiqariladi va TEKSHIRILADI; chiqmasa hech narsa yuborilmaydi. "
+                "Maydon topilsa `ui_type` afzal, bu esa yorliqlar uchun."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "combo": {"type": "string", "description": "masalan ctrl+s"},
+                    "handle": {"type": "integer", "description": "Qaysi oynaga"},
+                },
+                "required": ["combo", "handle"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "key_type",
+            "description": (
+                "Fokusdagi oynaga matn yozish (clipboard orqali — kirill va "
+                "o'zbekcha ham aniq tushadi). `handle` majburiy."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "handle": {"type": "integer"},
+                },
+                "required": ["text", "handle"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "clipboard",
+            "description": "Clipboard'ni o'qish yoki yozish. action: get | set",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["get", "set"]},
+                    "text": {"type": "string", "description": "set uchun"},
+                },
+                "required": ["action"],
+            },
+        },
+    },
 ]
 
 # Requires CAP_BROWSER. A separate path from the desktop layer on purpose: a
@@ -562,7 +615,7 @@ SYSTEM_TOOLS = [
 # Tools that are proposed to the user and executed only after an explicit tap.
 # ui_click is conditional: only an irreversible-looking label is confirmed, so
 # ordinary navigation stays fluid.
-_CONFIRM_TOOLS = {"sheet_write", "ui_click", "web_click", "window_close"}
+_CONFIRM_TOOLS = {"sheet_write", "ui_click", "web_click", "window_close", "key_press"}
 
 
 def tools_for(caps: list[str]) -> list[dict]:
@@ -927,7 +980,8 @@ class Brain:
         """Screen reading and control. Returns None if not a desktop tool."""
         from .config import CAP_DESKTOP, CAP_DESKTOP_CONTROL
 
-        if name not in {"list_windows", "read_window", "screen_read", "ui_click", "ui_type"}:
+        if name not in {"list_windows", "read_window", "screen_read", "ui_click",
+                        "ui_type", "key_press", "key_type", "clipboard"}:
             return None
         if CAP_DESKTOP not in self._caps:
             return self._denied(CAP_DESKTOP)
@@ -947,6 +1001,24 @@ class Brain:
 
         if CAP_DESKTOP_CONTROL not in self._caps:
             return self._denied(CAP_DESKTOP_CONTROL)
+
+        if name in ("key_press", "key_type", "clipboard"):
+            from . import keys
+
+            handle = int(args.get("handle", 0))
+            if name == "key_press":
+                return await loop.run_in_executor(
+                    None, lambda: keys.press(str(args.get("combo", "")), handle)
+                )
+            if name == "key_type":
+                return await loop.run_in_executor(
+                    None, lambda: keys.type_text(str(args.get("text", "")), handle)
+                )
+            if str(args.get("action", "get")) == "set":
+                return await loop.run_in_executor(
+                    None, lambda: keys.clipboard_set(str(args.get("text", "")))
+                )
+            return await loop.run_in_executor(None, keys.clipboard_get)
 
         handle, ref = int(args.get("handle", 0)), int(args.get("ref", 0))
         if name == "ui_click":
@@ -1072,6 +1144,20 @@ class Brain:
             CAP_BROWSER, CAP_DESKTOP_CONTROL, CAP_OFFICE_WRITE, CAP_SYSTEM,
         )
 
+        if name == "key_press":
+            if CAP_DESKTOP_CONTROL not in self._caps:
+                return self._denied(CAP_DESKTOP_CONTROL)
+            from . import keys
+
+            combo = str(args.get("combo", ""))
+            if not keys.is_dangerous(combo):
+                return {"skip": True}      # ordinary shortcuts just run
+            return {"summary": (
+                f"⚠️ Qaytarib bo'lmaydigan tugmalar:\n"
+                f"⌨ {keys.normalize(combo)}\n\n"
+                "Saqlanmagan ish yo'qolishi mumkin. Davom etaymi?"
+            )}
+
         if name == "window_close":
             if CAP_SYSTEM not in self._caps:
                 return self._denied(CAP_SYSTEM)
@@ -1150,6 +1236,21 @@ class Brain:
         args = action.get("args") or {}
         if name not in _CONFIRM_TOOLS:
             return "❌ Noma'lum amal."
+
+        if name == "key_press":
+            gate = self._describe_action(name, args)
+            if gate.get("error"):
+                return f"❌ {gate['error']}"
+            from . import keys
+
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                None,
+                lambda: keys.press(str(args.get("combo", "")), int(args.get("handle", 0))),
+            )
+            if not result.get("ok"):
+                return f"❌ {result.get('error', 'Bajarilmadi')}"
+            return f"✅ Yuborildi: {result.get('pressed')} → {result.get('window', '')}"
 
         if name == "window_close":
             gate = self._describe_action(name, args)
@@ -1300,7 +1401,13 @@ class Brain:
                 "  beradi (matn, xatolik, holat). Lekin aniq koordinata BERMAYDI —\n"
                 "  bosish uchun emas, faqat o'qish uchun."
                 + ("\n- O'chirish/yuborish kabi tugmalarda tizim tasdiq so'raydi —\n"
-                   "  sen qo'shimcha so'rama, to'g'ridan-to'g'ri chaqir."
+                   "  sen qo'shimcha so'rama, to'g'ridan-to'g'ri chaqir.\n"
+                   "- Klaviatura: `key_press` (ctrl+s, alt+tab, enter, f5) va\n"
+                   "  `key_type` (matn yozish, kirill ham aniq tushadi).\n"
+                   "  HAR DOIM `handle` ber — oyna oldinga chiqariladi va\n"
+                   "  TEKSHIRILADI; chiqmasa hech narsa yuborilmaydi.\n"
+                   "  Maydon topilgan bo'lsa `ui_type` afzal; `key_type` esa\n"
+                   "  UIA ko'rmaydigan ilovalar va yorliqlar uchun."
                    if _CDC in self._caps else "")
             )
 

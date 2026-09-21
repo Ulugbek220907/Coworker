@@ -26,6 +26,7 @@ code below:
 from __future__ import annotations
 
 import logging
+import os
 import queue
 import re
 import threading
@@ -511,8 +512,69 @@ def set_window_state(handle: int, state: int) -> dict:
     return _window_call(job)
 
 
+def foreground_handle() -> int:
+    """Whichever window actually has the keyboard right now."""
+    if os.name != "nt":
+        return 0
+    try:
+        import ctypes
+
+        return int(ctypes.windll.user32.GetForegroundWindow())
+    except Exception:
+        return 0
+
+
+def _force_foreground(handle: int) -> bool:
+    """Genuinely move the OS foreground to `handle`, and report whether it moved.
+
+    Windows refuses SetForegroundWindow from a process that is not already in
+    the foreground, so a plain call silently does nothing - which is how
+    keystrokes end up in whatever the user was typing in. Attaching to the
+    current foreground thread's input queue lifts that restriction. The return
+    value is checked against GetForegroundWindow rather than trusted.
+    """
+    if os.name != "nt":
+        return False
+    import ctypes
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    SW_RESTORE = 9
+
+    try:
+        if user32.IsIconic(handle):
+            user32.ShowWindow(handle, SW_RESTORE)
+
+        target_thread = user32.GetWindowThreadProcessId(handle, None)
+        current_thread = kernel32.GetCurrentThreadId()
+        fg_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+
+        attached = []
+        for other in {target_thread, fg_thread}:
+            if other and other != current_thread and user32.AttachThreadInput(current_thread, other, True):
+                attached.append(other)
+        try:
+            user32.BringWindowToTop(handle)
+            user32.SetForegroundWindow(handle)
+            user32.SetActiveWindow(handle)
+        finally:
+            for other in attached:
+                user32.AttachThreadInput(current_thread, other, False)
+    except Exception as exc:
+        log.info("foreground failed: %s", exc)
+        return False
+
+    import time
+
+    for _ in range(10):                 # give the switch a moment to settle
+        if foreground_handle() == handle:
+            return True
+        time.sleep(0.05)
+    return foreground_handle() == handle
+
+
 def focus_window(handle: int) -> dict:
-    """Bring a window to the front."""
+    """Bring a window to the front, and confirm it actually came forward."""
     if not available():
         return {"error": status()}
 
@@ -523,14 +585,28 @@ def focus_window(handle: int) -> dict:
         win = _locate(auto, "", handle)
         if win is None:
             return {"error": "Oyna topilmadi."}
+        name = _clean(win.Name)[:60]
         try:
-            state = win.GetWindowPattern().WindowVisualState
-            if state == 2:                       # minimized -> restore first
+            if win.GetWindowPattern().WindowVisualState == 2:
                 win.GetWindowPattern().SetWindowVisualState(0)
+        except Exception:
+            pass
+        try:
             win.SetFocus()
-            return {"ok": True, "window": _clean(win.Name)[:60]}
-        except Exception as exc:
-            return {"error": f"Fokusni o'tkazib bo'lmadi: {exc}"}
+        except Exception:
+            pass
+
+        if _force_foreground(handle):
+            return {"ok": True, "window": name, "foreground": True}
+        return {
+            "ok": False,
+            "window": name,
+            "foreground": False,
+            "error": (
+                f"«{name}» oynasini oldinga chiqarib bo'lmadi. Windows ba'zan "
+                "buni to'sadi (to'liq ekrandagi ilova yoki administrator oynasi)."
+            ),
+        }
 
     return _window_call(job)
 

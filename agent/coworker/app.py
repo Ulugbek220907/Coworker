@@ -219,6 +219,8 @@ class CoworkerAgent:
             if CAP_DESKTOP_CONTROL in caps:
                 lines += [
                     "  · «Explorer'da qidiruvga shuni yoz»",
+                    "  · «ctrl+s bos», «alt+tab qil» — klaviatura yorliqlari",
+                    "  · «clipboardda nima bor?»",
                     "  · Tugmalarni bosaman. O'chirish/yuborish kabi",
                     "    qaytarib bo'lmaydigan amallarda tasdiq so'rayman.",
                 ]

@@ -50,51 +50,60 @@ def status() -> str:
 
 # --------------------------------------------------------------------- volume
 
-def _endpoint():
-    """Default render device's IAudioEndpointVolume.
-
-    Built by hand through the MMDeviceEnumerator because the pycaw convenience
-    helper (AudioUtilities.GetSpeakers().Activate) is broken on the installed
-    version - GetSpeakers returns a wrapper with no Activate. This path is the
-    stable one.
-    """
-    from ctypes import POINTER, cast
-
-    from comtypes import CLSCTX_ALL, CoCreateInstance, GUID
-    from pycaw.pycaw import EDataFlow, ERole, IAudioEndpointVolume, IMMDeviceEnumerator
-
-    enumerator = CoCreateInstance(
-        GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}"),
-        IMMDeviceEnumerator, CLSCTX_ALL,
-    )
-    device = enumerator.GetDefaultAudioEndpoint(
-        EDataFlow.eRender.value, ERole.eMultimedia.value
-    )
-    iface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
-    return cast(iface, POINTER(IAudioEndpointVolume))
-
-
 def _with_audio(fn):
-    """Marshal an audio operation onto the shared COM thread.
+    """Run `fn(endpoint)` on the shared COM thread, releasing COM there too.
 
-    Core Audio (pycaw) and UI Automation both go through comtypes, whose lazy
-    type-library codegen is not thread-safe. Two separate STA worker threads
-    triggering that codegen at once segfaults - it was reproducible here the
-    first time list_windows ran after a volume call. Routing both through the
-    one uia worker thread means all COM work is serialised on a single
-    apartment, so there is never a concurrent-codegen race.
+    Two rules, both learned by crashing:
+
+    One apartment. Core Audio objects are apartment-bound, so every call is
+    marshalled onto the single uia worker thread rather than the asyncio
+    executor pool.
+
+    Release on the creating thread. This is the one that actually bit: the
+    endpoint was built on the worker thread but its refcount dropped later,
+    so Python finalized it on whichever thread happened to run the collection.
+    Releasing a COM pointer off its apartment gave "COM method call without
+    VTable" and then a segfault - the crash appeared as a window read failing
+    after a volume change, which is nowhere near the real cause. The objects
+    are therefore created, used, dropped and collected inside this one job.
     """
     from . import uia
 
-    return uia._worker.call(fn)
+    def job():
+        import gc
+        from ctypes import POINTER, cast
+
+        from comtypes import CLSCTX_ALL, CoCreateInstance, GUID
+        from pycaw.pycaw import (
+            EDataFlow, ERole, IAudioEndpointVolume, IMMDeviceEnumerator,
+        )
+
+        # Built by hand through MMDeviceEnumerator: the pycaw convenience
+        # helper (AudioUtilities.GetSpeakers().Activate) is broken on the
+        # installed version - GetSpeakers returns a wrapper with no Activate.
+        enumerator = CoCreateInstance(
+            GUID("{BCDE0395-E52F-467C-8E3D-C4579291692E}"),
+            IMMDeviceEnumerator, CLSCTX_ALL,
+        )
+        device = enumerator.GetDefaultAudioEndpoint(
+            EDataFlow.eRender.value, ERole.eMultimedia.value
+        )
+        iface = device.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = cast(iface, POINTER(IAudioEndpointVolume))
+        try:
+            return fn(volume)
+        finally:
+            del volume, iface, device, enumerator
+            gc.collect()      # finalize here, on the apartment that owns them
+
+    return uia._worker.call(job)
 
 
 def get_volume() -> dict:
     if not available():
         return {"error": status()}
 
-    def job():
-        vol = _endpoint()
+    def job(vol):
         return {
             "percent": round(vol.GetMasterVolumeLevelScalar() * 100),
             "muted": bool(vol.GetMute()),
@@ -112,8 +121,7 @@ def set_volume(percent: float) -> dict:
         return {"error": status()}
     target = max(0.0, min(100.0, float(percent)))
 
-    def job():
-        vol = _endpoint()
+    def job(vol):
         if vol.GetMute():
             vol.SetMute(0, None)          # setting a level implies unmute
         vol.SetMasterVolumeLevelScalar(target / 100.0, None)
@@ -130,8 +138,7 @@ def adjust_volume(delta: float) -> dict:
     if not available():
         return {"error": status()}
 
-    def job():
-        vol = _endpoint()
+    def job(vol):
         current = vol.GetMasterVolumeLevelScalar() * 100
         target = max(0.0, min(100.0, current + float(delta)))
         if vol.GetMute() and delta > 0:
@@ -153,8 +160,7 @@ def set_mute(mute: bool) -> dict:
     if not available():
         return {"error": status()}
 
-    def job():
-        vol = _endpoint()
+    def job(vol):
         vol.SetMute(1 if mute else 0, None)
         return {"ok": True, "muted": bool(vol.GetMute())}
 

@@ -356,6 +356,32 @@ Bosish uchun UIA (aniq) yoki brauzer (DOM) ishlatiladi.
 > Skrinshot faqat siz ekranni o'qishni so'raganda olinadi — uzluksiz emas.
 > Ekran matni ham begona kontent: ma'lumot, ko'rsatma emas.
 
+## Klaviatura va clipboard
+
+`desktop_control` ruxsati bilan agent klaviatura yorliqlarini yuboradi va
+matn yozadi — UIA maydon topa olmaydigan ilovalarda ham.
+
+```
+  u: VS Code'da ctrl+s bos
+ AI: ✅ Yuborildi: ctrl+s → requirements.txt - Visual Studio Code
+```
+
+**Fokus — xavfsizlik chegarasi.** Tugmalar fokusdagi oynaga boradi, shuning
+uchun agent avval oynani oldinga chiqaradi **va tekshiradi**. Chiqara olmasa
+(Windows ba'zan to'sadi) — **hech narsa yubormaydi**. Bu jiddiy: sinovda
+"fokus berildi" deb ko'rsatilgan oynaga yozilgan matn aslida boshqa joyga
+ketayotgani aniqlandi.
+
+**Matn clipboard orqali qo'yiladi**, harflab yozilmaydi. Sabab o'lchandi:
+harflab yozganda `"klaviatura testi 456"` → `"llaviatura tttti 666"` bo'lib
+buzildi, va kirill umuman yozilmasdi. Clipboard aniq qo'yadi; eski
+clipboard qiymatingiz keyin tiklanadi.
+
+| Kombinatsiya | Natija |
+|---|---|
+| `ctrl+s`, `enter`, `alt+tab`, `f5` | to'g'ridan-to'g'ri bajariladi |
+| `alt+f4`, `ctrl+w`, `shift+delete`, `win+l` | ⚠️ tasdiq so'raladi |
+
 ## Xavfsizlik
 
 - **Faqat ulangan chatlar.** Kod noutbuk ekranida ko'rinadi va bir martalik.
