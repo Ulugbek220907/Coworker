@@ -219,7 +219,8 @@ class CoworkerAgent:
                      "  · «Telegram ni och», «Chrome ni och» — dastur ochish"]
             if CAP_DESKTOP_CONTROL in caps:
                 lines += [
-                    "  · «Explorer'da qidiruvga shuni yoz»",
+                    "  · «Claude Code / Antigravity ga ayt: ...» — dasturga buyruq",
+                    "    beraman, javobini o'qib aytaman",
                     "  · «ctrl+s bos», «alt+tab qil» — klaviatura yorliqlari",
                     "  · «clipboardda nima bor?»",
                     "  · Tugmalarni bosaman. O'chirish/yuborish kabi",
