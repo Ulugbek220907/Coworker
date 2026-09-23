@@ -121,13 +121,16 @@ class LLM:
         image_b64: str,
         *,
         model: str,
-        max_tokens: int = 500,
+        max_tokens: int = 1600,
     ) -> str:
         """One image + prompt call, against a vision-capable model.
 
-        A reasoning model (deepseek-flash) sometimes leaves `content` empty and
-        puts its answer in `reasoning_content`, so fall back to that rather than
-        returning nothing.
+        deepseek-flash reasons before answering: its thinking goes to
+        reasoning_content and the real answer to content. If max_tokens is too
+        small it runs out mid-thought and content comes back empty - which is
+        how "screen_now" ended up full of "We need answer in Uzbek likely...".
+        So the budget is generous, and if content is still empty the last line
+        of the reasoning is used rather than the whole rambling trace.
         """
         payload = {
             "model": model,
@@ -157,8 +160,12 @@ class LLM:
         msg = choices[0].get("message", {})
         text = (msg.get("content") or "").strip()
         if not text:
-            text = (msg.get("reasoning_content") or "").strip()
-        return text or "(bo'sh javob)"
+            # Salvage a conclusion from the reasoning rather than dumping the
+            # whole "We need to analyse..." trace back to the caller.
+            reasoning = (msg.get("reasoning_content") or "").strip()
+            tail = [ln.strip() for ln in reasoning.splitlines() if ln.strip()]
+            text = tail[-1] if tail else ""
+        return text or "(javob olinmadi — qayta urinib ko'ring)"
 
     async def ping(self) -> tuple[bool, str]:
         """Used by the settings window's Test button."""

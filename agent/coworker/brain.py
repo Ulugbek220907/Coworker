@@ -403,6 +403,33 @@ CONTROL_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "control_app",
+            "description": (
+                "Dasturga (Antigravity, Claude Code, Cursor, terminal, chat "
+                "ilovasi) buyruq berish — O'ZI TEKSHIRADI. Bitta chaqiruvda: "
+                "oynani topadi/oldinga chiqaradi, matnni maydonga yozadi, kerak "
+                "bo'lsa yuboradi, KEYIN ekranни o'qib HAQIQIY holatni qaytaradi "
+                "(`screen_now`). «Claude Code'ga yoz», «Antigravity'ga ayt» kabi "
+                "so'rovlar uchun SHUNI ishlat — alohida focus/type/enter emas."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "app": {"type": "string", "description": "Dastur/oyna nomi, masalan «Antigravity»"},
+                    "action": {
+                        "type": "string",
+                        "enum": ["type", "send", "clear", "read"],
+                        "description": "type=yoz(yubormay), send=yoz+yubor, clear=tozala, read=o'qi",
+                    },
+                    "text": {"type": "string", "description": "type/send uchun matn"},
+                },
+                "required": ["app", "action"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "ui_click",
             "description": (
                 "read_window bergan raqamdagi elementni bosish. "
@@ -997,7 +1024,8 @@ class Brain:
         from .config import CAP_DESKTOP, CAP_DESKTOP_CONTROL
 
         if name not in {"list_windows", "read_window", "screen_read", "open_app",
-                        "ui_click", "ui_type", "key_press", "key_type", "clipboard"}:
+                        "control_app", "ui_click", "ui_type", "key_press",
+                        "key_type", "clipboard"}:
             return None
         if CAP_DESKTOP not in self._caps:
             return self._denied(CAP_DESKTOP)
@@ -1029,6 +1057,12 @@ class Brain:
 
         if CAP_DESKTOP_CONTROL not in self._caps:
             return self._denied(CAP_DESKTOP_CONTROL)
+
+        if name == "control_app":
+            return await self._control_app(
+                str(args.get("app", "")), str(args.get("action", "read")),
+                str(args.get("text", "")),
+            )
 
         if name in ("key_press", "key_type", "clipboard"):
             from . import keys
@@ -1137,6 +1171,202 @@ class Brain:
             )
         # window_close is in _CONFIRM_TOOLS and never reaches here directly.
         return {"error": "window_close tasdiq orqali bajariladi"}
+
+    async def _control_app(self, app: str, action: str, text: str) -> ToolResult:
+        """One self-verifying primitive for driving an app (Antigravity, Claude
+        Code, a terminal, any window).
+
+        Every step is checked, and the result is what the SCREEN actually shows
+        afterwards - never a blind "done". This exists because the model kept
+        reporting success it had not verified: cleared a field that still had
+        text, "opened" a window that stayed behind others, called a field empty
+        when it was not.
+        """
+        from . import keys, launcher, uia, vision
+
+        loop = asyncio.get_running_loop()
+
+        # 1. Resolve the target window. Prefer an already-open one; open it if
+        #    it is an app name that is not open yet.
+        handle = await loop.run_in_executor(None, lambda: self._resolve_window(app))
+        if not handle:
+            opened = await loop.run_in_executor(None, lambda: launcher.launch(app))
+            if not opened.get("ok"):
+                return {"error": f"«{app}» oynasi topilmadi va ochilmadi."}
+            await asyncio.sleep(1.5)
+            handle = await loop.run_in_executor(None, lambda: self._resolve_window(app))
+            if not handle:
+                return {"error": f"«{app}» ochildi, lekin oynasi topilmadi."}
+
+        # 2. Bring it to the front, verified. One retry.
+        focus = await loop.run_in_executor(None, lambda: uia.focus_window(handle))
+        if not focus.get("ok"):
+            await asyncio.sleep(0.4)
+            focus = await loop.run_in_executor(None, lambda: uia.focus_window(handle))
+            if not focus.get("ok"):
+                return {"error": focus.get("error", "Oynani oldinga chiqarib bo'lmadi."),
+                        "hint": "Oyna boshqa oyna ortida yoki to'liq ekran ilova xalaqit qilyapti."}
+        title = focus.get("window", app)
+
+        if action == "read":
+            seen = await self._read_window_vision(handle, "Ekranda nima ko'rinyapti?")
+            return {"ok": True, "window": title, "screen_now": seen}
+
+        if action == "clear":
+            await self._do_type(handle, "", click=True)
+            empty = await self._verify(handle, "", is_clear=True)
+            seen = await self._read_window_vision(handle, "Kiritish maydoni bo'sh mi?")
+            return {"ok": empty, "window": title, "cleared": empty, "screen_now": seen}
+
+        # type / send: try, verify, retry once with a click, verify, report
+        # HONESTLY. Some Electron editors (Antigravity) accept synthetic input
+        # only intermittently, so a blind "done" would be a lie - the whole
+        # point of this tool is that the result is checked.
+        landed = False
+        for attempt in range(2):
+            await self._do_type(handle, text, click=(attempt == 1))
+            landed = await self._verify(handle, text, is_clear=False)
+            if landed:
+                break
+
+        if not landed:
+            return {
+                "ok": False,
+                "window": title,
+                "typed": False,
+                "error": (
+                    f"«{text[:30]}» matnini {title} ilovasiga yoza olmadim — "
+                    "tekshirdim, tushmadi. Bu ilova avtomatik kiritishni qabul "
+                    "qilmayapti (Antigravity kabi ba'zi ilovalar shunday)."
+                ),
+                "advice": (
+                    "Ishonchli yo'l: terminal (Claude Code) — u yerda kiritish "
+                    "va o'qish aniq ishlaydi. Yoki ilova oynasida bir marta chat "
+                    "maydonini bosib qo'ying, keyin qayta urinaman."
+                ),
+            }
+
+        if action == "send":
+            await asyncio.sleep(0.2)
+            await loop.run_in_executor(None, lambda: keys.press("enter", handle))
+            await asyncio.sleep(2.5)              # let the reply begin
+
+        seen = await self._read_window_vision(
+            handle,
+            "Oxirgi xabar/javob yoki kiritish maydonida nima yozilgan? Qisqa ayt.",
+        )
+        return {"ok": True, "window": title, "typed": True,
+                "action": action, "screen_now": seen}
+
+    async def _do_type(self, handle: int, text: str, click: bool) -> None:
+        """Put `text` in the focused window's input (text="" clears)."""
+        from . import keys, uia
+
+        loop = asyncio.get_running_loop()
+        if click:
+            spot = await self._locate_input(handle)
+            if spot:
+                await loop.run_in_executor(None, lambda: uia.click_at(spot[0], spot[1]))
+                await asyncio.sleep(0.3)
+        await loop.run_in_executor(None, lambda: keys.replace_text(handle, text))
+        await asyncio.sleep(0.4)
+
+    async def _verify(self, handle: int, text: str, is_clear: bool) -> bool:
+        """Vision yes/no: did the text land (or the field clear)?"""
+        from . import vision
+
+        loop = asyncio.get_running_loop()
+        shot = await loop.run_in_executor(None, lambda: vision.capture(handle=handle))
+        if shot.get("error"):
+            return False
+        if is_clear:
+            q = "Kiritish/matn maydoni butunlay BO'SHmi (faqat placeholder)? Faqat: HA yoki YO'Q."
+        else:
+            q = (f"Ekranда «{text[:40]}» matni kiritish maydonida yoki xabarda "
+                 "ko'rinyaptimi? Faqat: HA yoki YO'Q.")
+        model = str(self.cfg.get("vision_model", "deepseek-flash"))
+        try:
+            ans = await self.llm.vision(q, shot["image_b64"], model=model, max_tokens=1200)
+        except LLMError:
+            return False
+        low = ans.strip().lower()
+        return low.startswith("ha") or "\nha" in low or " ha " in f" {low} "
+
+    async def _read_window_vision(self, handle: int, question: str) -> str:
+        from . import vision
+
+        loop = asyncio.get_running_loop()
+        shot = await loop.run_in_executor(None, lambda: vision.capture(handle=handle))
+        if shot.get("error"):
+            return "(ekran o'qilmadi)"
+        model = str(self.cfg.get("vision_model", "deepseek-flash"))
+        try:
+            return await self.llm.vision(
+                f"{vision.DEFAULT_PROMPT}\n\nSAVOL: {question}", shot["image_b64"], model=model
+            )
+        except LLMError as exc:
+            return f"(o'qilmadi: {exc})"
+
+    async def _locate_input(self, handle: int) -> tuple[int, int] | None:
+        """Screen coords of the app's text input, for a click-to-focus.
+
+        Vision only has to place a large input box, not a pixel - it gets that
+        right where it fails on small buttons. Falls back to bottom-centre,
+        where chat inputs usually sit, if vision cannot say.
+        """
+        from . import uia, vision
+
+        loop = asyncio.get_running_loop()
+        rect = await loop.run_in_executor(None, lambda: vision._window_rect("", handle))
+        if not rect:
+            return None
+        left, top, right, bottom = rect
+        w, h = right - left, bottom - top
+
+        shot = await loop.run_in_executor(None, lambda: vision.capture(handle=handle))
+        hx, vy = 0.5, 0.88          # fallback: bottom-centre
+        if not shot.get("error"):
+            model = str(self.cfg.get("vision_model", "deepseek-flash"))
+            q = ("Bu ilova oynasi. Matn KIRITISH maydoni (input box) markazi "
+                 "oynaning qayerida? Faqat ikki son: gorizontal_foiz,vertikal_foiz "
+                 "(0-100). Masalan: 58,88")
+            try:
+                ans = await self.llm.vision(q, shot["image_b64"], model=model, max_tokens=1200)
+                import re
+
+                m = re.findall(r"(\d{1,3})\s*[,x/]\s*(\d{1,3})", ans)
+                if m:
+                    px, py = int(m[-1][0]), int(m[-1][1])
+                    if 0 <= px <= 100 and 0 <= py <= 100:
+                        hx, vy = px / 100, py / 100
+            except Exception:
+                pass
+        return left + int(w * hx), top + int(h * vy)
+
+    def _resolve_window(self, app: str) -> int:
+        """Handle of an open window matching `app` (int handle, exact, or fuzzy)."""
+        from . import uia
+        from .textutil import normalize
+
+        app = str(app).strip()
+        if app.isdigit():
+            return int(app)
+        wins = uia.list_windows().get("windows", [])
+        want = normalize(app)
+        if not want:
+            return 0
+        # exact title, then contains, then token overlap.
+        for w in wins:
+            if normalize(w["title"]) == want:
+                return w["handle"]
+        for w in wins:
+            n = normalize(w["title"])
+            if want in n or n in want:
+                return w["handle"]
+        for w in wins:
+            if any(tok in normalize(w["title"]) for tok in want.split() if len(tok) > 2):
+                return w["handle"]
+        return 0
 
     async def _screen_read(self, question: str, title: str, handle: int = 0) -> ToolResult:
         """Capture the screen (or a window) and ask the vision model about it."""

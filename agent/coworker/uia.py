@@ -607,6 +607,30 @@ def _force_foreground(handle: int) -> bool:
     return foreground_handle() == handle
 
 
+def click_at(x: int, y: int) -> dict:
+    """Real mouse click at screen coordinates.
+
+    Electron/Chromium editors (Antigravity, VS Code, Cursor) do not accept
+    keyboard input reliably until a real click gives their internal editor the
+    caret - window focus alone is not enough. Clicking a large target like a
+    chat input box does not need pixel precision, so a coarse vision-located
+    point is enough; a terminal is happy with a click anywhere too.
+    """
+    if not available():
+        return {"error": status()}
+
+    def job():
+        import uiautomation as auto
+
+        try:
+            auto.Click(int(x), int(y), waitTime=0.1)
+            return {"ok": True, "at": [int(x), int(y)]}
+        except Exception as exc:
+            return {"error": f"Bosib bo'lmadi: {exc}"}
+
+    return _window_call(job)
+
+
 def focus_window(handle: int) -> dict:
     """Bring a window to the front, and confirm it actually came forward."""
     if not available():

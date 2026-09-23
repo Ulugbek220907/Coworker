@@ -219,6 +219,65 @@ def type_text(text: str, handle: int = 0) -> dict:
     return _run(job)
 
 
+def replace_text(handle: int, text: str) -> dict:
+    """Select-all, delete, then paste `text` - all in ONE focused session.
+
+    Doing ctrl+a and delete as two separate calls re-forces the foreground
+    between them, and that re-focus was clearing the selection so the delete
+    did nothing - the "I cleared it" that left the text sitting there. Holding
+    focus for the whole sequence fixes it. text="" just clears.
+    """
+    if not available():
+        return {"error": status()}
+    blocked = _ensure_focus(handle)
+    if blocked:
+        return blocked
+
+    def job():
+        import time
+
+        import uiautomation as auto
+
+        # Select all and delete.
+        auto.PressKey(auto.Keys.VK_CONTROL)
+        auto.PressKey(auto.Keys.VK_A)
+        time.sleep(0.03)
+        auto.ReleaseKey(auto.Keys.VK_A)
+        auto.ReleaseKey(auto.Keys.VK_CONTROL)
+        time.sleep(0.05)
+        auto.PressKey(auto.Keys.VK_DELETE)
+        time.sleep(0.03)
+        auto.ReleaseKey(auto.Keys.VK_DELETE)
+        time.sleep(0.08)
+
+        if text:
+            previous = ""
+            try:
+                previous = auto.GetClipboardText() or ""
+            except Exception:
+                pass
+            auto.SetClipboardText(text)
+            time.sleep(0.2)
+            auto.PressKey(auto.Keys.VK_CONTROL)
+            auto.PressKey(auto.Keys.VK_V)
+            time.sleep(0.05)
+            auto.ReleaseKey(auto.Keys.VK_V)
+            auto.ReleaseKey(auto.Keys.VK_CONTROL)
+            # An Electron editor reads the clipboard asynchronously after the
+            # ctrl+v event; restoring it too soon means the paste lands the OLD
+            # clipboard - or nothing. Verified this was why typed text vanished.
+            # Wait well past the paste before putting the clipboard back.
+            time.sleep(0.7)
+            try:
+                auto.SetClipboardText(previous)
+            except Exception:
+                pass
+
+        return {"ok": True, "window": _focused_title()}
+
+    return _run(job)
+
+
 def clipboard_get() -> dict:
     if not available():
         return {"error": status()}
