@@ -35,7 +35,7 @@ def status() -> str:
     return "tayyor"
 
 
-def capture(title: str = "") -> dict:
+def capture(title: str = "", handle: int = 0) -> dict:
     """Grab the whole screen, or one window's region by title.
 
     Returns {"image_b64", "size", "scope"} or {"error"}.
@@ -47,7 +47,13 @@ def capture(title: str = "") -> dict:
 
     bbox = None
     scope = "butun ekran"
-    if title:
+    if handle:
+        rect = _window_rect("", handle)
+        if rect is None:
+            return {"error": "Oyna topilmadi."}
+        bbox = rect
+        scope = _title_of(handle) or "oyna"
+    elif title:
         rect = _window_rect(title)
         if rect is None:
             return {"error": f"«{title}» oynasi topilmadi."}
@@ -75,7 +81,13 @@ def capture(title: str = "") -> dict:
     }
 
 
-def _window_rect(title: str):
+def _title_of(handle: int) -> str:
+    from . import uia
+    info = uia.window_by_handle(handle)
+    return (info or {}).get("title", "") if info else ""
+
+
+def _window_rect(title: str, handle: int = 0):
     """A window's on-screen rectangle, via the UIA layer."""
     from . import uia
 
@@ -86,7 +98,7 @@ def _window_rect(title: str):
         import uiautomation as auto
 
         auto.SetGlobalSearchTimeout(1)
-        win = uia._locate(auto, title, 0)
+        win = uia._locate(auto, title, handle)
         if win is None:
             return None
         try:

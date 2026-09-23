@@ -1023,7 +1023,8 @@ class Brain:
             return await loop.run_in_executor(None, lambda: uia.read_window(title))
         if name == "screen_read":
             return await self._screen_read(
-                str(args.get("question", "")), str(args.get("title", ""))
+                str(args.get("question", "")), str(args.get("title", "")),
+                int(args.get("handle", 0)),
             )
 
         if CAP_DESKTOP_CONTROL not in self._caps:
@@ -1137,7 +1138,7 @@ class Brain:
         # window_close is in _CONFIRM_TOOLS and never reaches here directly.
         return {"error": "window_close tasdiq orqali bajariladi"}
 
-    async def _screen_read(self, question: str, title: str) -> ToolResult:
+    async def _screen_read(self, question: str, title: str, handle: int = 0) -> ToolResult:
         """Capture the screen (or a window) and ask the vision model about it."""
         from . import vision
 
@@ -1145,7 +1146,7 @@ class Brain:
             return {"error": vision.status()}
 
         loop = asyncio.get_running_loop()
-        shot = await loop.run_in_executor(None, lambda: vision.capture(title))
+        shot = await loop.run_in_executor(None, lambda: vision.capture(title, handle))
         if shot.get("error"):
             return shot
 
@@ -1438,7 +1439,17 @@ class Brain:
                    "  HAR DOIM `handle` ber — oyna oldinga chiqariladi va\n"
                    "  TEKSHIRILADI; chiqmasa hech narsa yuborilmaydi.\n"
                    "  Maydon topilgan bo'lsa `ui_type` afzal; `key_type` esa\n"
-                   "  UIA ko'rmaydigan ilovalar va yorliqlar uchun."
+                   "  UIA ko'rmaydigan ilovalar va yorliqlar uchun.\n"
+                   "\nDASTURGA BUYRUQ BERISH (Claude Code, Antigravity, terminal,\n"
+                   "AI chat ilovalari) — bu ILOVANI BOSHQARISH namunasi:\n"
+                   "  1. `list_windows` bilan oynani top (yoki `open_app` bilan och).\n"
+                   "  2. `key_type` bilan buyruq matnini yoz (handle ber).\n"
+                   "  3. `key_press` `enter` bilan yubor.\n"
+                   "  4. Bir-ikki soniya kut, keyin `screen_read` bilan SHU oynani\n"
+                   "     o'qi (handle ber!) — javobni ko'rib foydalanuvchiga ayt.\n"
+                   "  5. Javob uzun/oqib kelayotgan bo'lsa — biroz kutib qayta\n"
+                   "     `screen_read` qil. Terminal matnini UIA o'qimaydi, faqat\n"
+                   "     `screen_read` (vision) o'qiydi."
                    if _CDC in self._caps else "")
             )
 
