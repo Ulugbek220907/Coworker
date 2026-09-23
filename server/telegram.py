@@ -114,6 +114,26 @@ class Telegram:
         except Exception:
             return {"ok": False, "description": r.text[:200]}
 
+    async def send_photo(
+        self, chat_id: int, filename: str, content: bytes, caption: str = ""
+    ) -> dict:
+        """Images go as photos so they preview inline on the phone rather than
+        arriving as a file to download - screenshots and scans especially."""
+        files = {"photo": (filename, content, "application/octet-stream")}
+        data = {"chat_id": str(chat_id)}
+        if caption:
+            data["caption"] = caption[:1000]
+        r = await self._client.post(f"{self.base}/sendPhoto", data=data, files=files)
+        try:
+            out = r.json()
+        except Exception:
+            return {"ok": False, "description": r.text[:200]}
+        # Telegram rejects oversized or odd-ratio images as photos; fall back
+        # to a document so the user still gets the file.
+        if not out.get("ok"):
+            return await self.send_document(chat_id, filename, content, caption)
+        return out
+
     async def set_webhook(self, url: str, secret: str) -> dict:
         return await self.call(
             "setWebhook",

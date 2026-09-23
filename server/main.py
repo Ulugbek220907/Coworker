@@ -304,7 +304,14 @@ async def upload(
         await tg.send_text(chat_id, "⚠️ Fayl juda katta (50 MB limit).")
         raise HTTPException(413, "file too large")
 
-    res = await tg.send_document(chat_id, file.filename or "document", content, caption)
+    name = file.filename or "document"
+    # Images preview inline as photos; Telegram caps a photo at 10 MB, so
+    # larger images still go as a document.
+    is_image = name.lower().rsplit(".", 1)[-1] in ("png", "jpg", "jpeg", "webp", "gif")
+    if is_image and len(content) <= 10 * 1024 * 1024:
+        res = await tg.send_photo(chat_id, name, content, caption)
+    else:
+        res = await tg.send_document(chat_id, name, content, caption)
     return JSONResponse({"ok": bool(res.get("ok")), "error": res.get("description")})
 
 
