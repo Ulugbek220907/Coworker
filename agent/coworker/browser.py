@@ -145,6 +145,27 @@ def _profile_dir():
     return d
 
 
+def _clear_stale_lock() -> None:
+    """Remove a leftover Chrome singleton lock in the agent's own profile.
+
+    If the agent crashed with its browser open, a SingletonLock stays behind
+    and the next launch_persistent_context fails with "profile in use" - which
+    would leave the browser permanently broken until the folder is cleaned by
+    hand. On Windows these are ordinary files/junctions we own, safe to delete;
+    Chrome recreates them.
+    """
+    import os
+
+    d = _profile_dir()
+    for name in ("SingletonLock", "SingletonCookie", "SingletonSocket"):
+        try:
+            target = d / name
+            if target.exists() or target.is_symlink():
+                target.unlink()
+        except OSError:
+            pass
+
+
 # Visible by default: the user signs in through this window, and seeing what
 # is being done on their behalf is a feature, not overhead. Settings can
 # flip it for a machine nobody is sitting at.
@@ -185,6 +206,7 @@ def _ensure_page(headless: bool | None = None):
         args=["--disable-blink-features=AutomationControlled",
               "--no-first-run", "--no-default-browser-check"],
     )
+    _clear_stale_lock()
     try:
         _state.context = _state.playwright.chromium.launch_persistent_context(
             channel=CHANNEL, **common
@@ -193,6 +215,7 @@ def _ensure_page(headless: bool | None = None):
     except Exception as exc:
         # No real Chrome, or it is briefly locked - fall back to bundled Chromium.
         log.info("channel %r unavailable (%s); using bundled Chromium", CHANNEL, exc)
+        _clear_stale_lock()
         _state.context = _state.playwright.chromium.launch_persistent_context(**common)
         _state.channel = "chromium"
 
