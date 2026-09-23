@@ -325,16 +325,18 @@ haqiqiy Google Chrome**'ni ishlatadi (`channel="chrome"`). Bu eclass.uz kabi
 saytlar ochilmagan muammoni hal qiladi — render va tarmoq odatdagi Chrome
 bilan bir xil. Chrome yo'q bo'lsa, Playwright'ning Chromium'iga qaytadi.
 
-### Ikki rejim
+### Bitta ishonchli rejim
 
-Sozlamalarda brauzer rejimini tanlaysiz:
+Agent **o'z Chrome oynasida** ishlaydi (haqiqiy Chrome, Playwright orqali).
+Saytlarga bir marta kirasiz — sessiya shu profilda abadiy saqlanadi. Kundalik
+Chrome'ingizga tegilmaydi va yopilmaydi.
 
-| Rejim | Nima |
-|---|---|
-| `profile` | Agent'ning alohida Chrome profili. Saytlarga bir marta kirasiz, sessiya saqlanadi. Kundalik Chrome'ingizga tegilmaydi. |
-| `cdp` | Sizning **haqiqiy Chrome'ingiz** — kirgan akkauntlaringiz bilan. Agent Chrome'ni debug portida sizning profilingiz bilan ochadi va ulanadi. |
-
-> `cdp` rejimida odatdagi Chrome **yopiq** bo'lishi kerak (Chrome bitta profilga bitta nusxa) — agent uni o'zi akkauntlaringiz bilan qayta ochadi. Ochiq bo'lsa, agent buni aniqlab, «avval Chrome'ni yoping» deydi. Agent Chrome'ingizni **hech qachon o'zi yopmaydi** — faqat ulanishni uzadi.
+> **Nega "mening akkauntlarim"ga to'g'ridan-to'g'ri ulanmaydi?** Chrome 136+
+> (sizda 153) xavfsizlik uchun haqiqiy profilda masofaviy debug'ni **bloklaydi**
+> — shuning uchun "sizning tirik Chrome'ingizga ulanish" zamonaviy Chrome'da
+> ishlamaydi. Cookie/parol fayllaringizni nusxalash esa xavfli, men buni
+> qilmayman. O'rniga: agent oynasida bir marta login qilasiz (masalan
+> eclass, youtube), keyin masofadan bemalol ishlaydi.
 
 ## Ekranni o'qish (vision — 3-bosqich)
 

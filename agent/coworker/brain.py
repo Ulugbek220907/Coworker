@@ -1065,9 +1065,6 @@ class Brain:
         from . import browser
 
         browser.HEADLESS = bool(self.cfg.get("browser_headless", False))
-        browser.MODE = str(self.cfg.get("browser_mode", "profile"))
-        browser.CDP_PORT = int(self.cfg.get("browser_cdp_port", 9222))
-        browser.CHROME_PROFILE = str(self.cfg.get("chrome_profile", "Default"))
         loop = asyncio.get_running_loop()
 
         if name == "web_open":
