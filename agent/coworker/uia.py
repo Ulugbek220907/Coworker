@@ -392,11 +392,45 @@ def _walk(win, limit: int) -> Snapshot:
 
     snap.seconds = time.monotonic() - started
     if not snap.elements:
-        snap.note = (
-            "Bo'sh daraxt. Electron/Chromium ilovasi bo'lsa, accessibility "
-            "o'chiq bo'lishi mumkin."
-        )
+        web = _web_alternative(snap.title)
+        if web:
+            snap.note = (
+                f"Bu ilovaning tugmalarini o'qib bo'lmadi (Telegram/Qt kabi "
+                f"ilovalar accessibility bermaydi). ISHONCHLI YO'L: brauzerda "
+                f"web versiyasini och — `web_open` bilan {web} — u yerda "
+                f"akkauntingiz bilan bemalol bosish/yozish mumkin."
+            )
+        else:
+            snap.note = (
+                "Bo'sh daraxt. Electron/Qt ilovasi accessibility bermayapti. "
+                "Web versiyasi bo'lsa, brauzerda ochib boshqargan ma'qul."
+            )
     return snap
+
+
+# Native apps whose UIA tree is unusable but which have a full web version the
+# browser layer drives reliably. Routing "control Telegram" through
+# web.telegram.org sidesteps the accessibility problem entirely.
+_WEB_APPS = {
+    "telegram": "https://web.telegram.org/a/",
+    "discord": "https://discord.com/app",
+    "whatsapp": "https://web.whatsapp.com",
+    "slack": "https://app.slack.com",
+    "spotify": "https://open.spotify.com",
+}
+
+
+def _web_alternative(title: str) -> str:
+    low = (title or "").lower()
+    for name, url in _WEB_APPS.items():
+        if name in low:
+            return url
+    return ""
+
+
+def web_alternative(app_name: str) -> str:
+    """Public: the web URL for an app the browser can drive instead."""
+    return _web_alternative(app_name)
 
 
 def _value_of(control, kind: str) -> str:

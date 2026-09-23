@@ -382,6 +382,33 @@ clipboard qiymatingiz keyin tiklanadi.
 | `ctrl+s`, `enter`, `alt+tab`, `f5` | to'g'ridan-to'g'ri bajariladi |
 | `alt+f4`, `ctrl+w`, `shift+delete`, `win+l` | ⚠️ tasdiq so'raladi |
 
+## Dastur ochish va Electron ilovalar
+
+`desktop` ruxsati bilan agent dasturlarni ochadi — Start menyu va ish stoli
+yorliqlaridan (~160 ta), nomni o'zbekcha/ruscha topadi:
+
+```
+  u: Telegram ni och
+ AI: ✅ Telegram ochildi.
+```
+
+**Electron/Qt ilovalar** (Telegram, Discord, WhatsApp) UIA daraxtini bo'sh
+qaytaradi — ularda tugmalarni ishonchli bosib bo'lmaydi. Yechim: **web
+versiyasi**. CDP rejimida sizning Chrome'ingiz akkauntlaringiz bilan ochilgani
+uchun, agent `web.telegram.org` ni ochib DOM orqali chat bosadi, xabar yozadi
+— aniq va ishonchli:
+
+```
+  u: Telegram'da Shaxzodga xabar yoz
+ AI: web.telegram.org ochildi (akkauntingiz bilan). Shaxzod chati topildi...
+```
+
+**Nega vision bilan bosmaydi?** Sinab ko'rdim: DeepSeek vision ekranni
+*tasvirlaydi*, lekin aniq *koordinata* bera olmaydi (to'r usulida 54 katakdan
+100-chisini tanladi). Noto'g'ri joyga bosadigan kliker — bosmaslikdan yomon,
+shuning uchun qo'shilmadi. O'rniga: native app → web versiya (DOM), yoki UIA
+(aniq), yoki `screen_read` (faqat o'qish).
+
 ## Xavfsizlik
 
 - **Faqat ulangan chatlar.** Kod noutbuk ekranida ko'rinadi va bir martalik.
