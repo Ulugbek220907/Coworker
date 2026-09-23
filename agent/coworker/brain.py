@@ -363,6 +363,22 @@ DESKTOP_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "open_app",
+            "description": (
+                "Kompyuterda dastur ochish: «Telegram», «Chrome», «Antigravity», "
+                "«Notepad» va h.k. Start menyu va ish stoli yorliqlaridan topadi. "
+                "Foydalanuvchi «X ni och» desa shuni ishlat."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"name": {"type": "string", "description": "Dastur nomi"}},
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "screen_read",
             "description": (
                 "Ekranni RASM sifatida ko'rib, savolga javob berish. "
@@ -980,8 +996,8 @@ class Brain:
         """Screen reading and control. Returns None if not a desktop tool."""
         from .config import CAP_DESKTOP, CAP_DESKTOP_CONTROL
 
-        if name not in {"list_windows", "read_window", "screen_read", "ui_click",
-                        "ui_type", "key_press", "key_type", "clipboard"}:
+        if name not in {"list_windows", "read_window", "screen_read", "open_app",
+                        "ui_click", "ui_type", "key_press", "key_type", "clipboard"}:
             return None
         if CAP_DESKTOP not in self._caps:
             return self._denied(CAP_DESKTOP)
@@ -989,6 +1005,17 @@ class Brain:
         from . import uia
 
         loop = asyncio.get_running_loop()
+        if name == "open_app":
+            from . import launcher
+
+            result = await loop.run_in_executor(
+                None, lambda: launcher.launch(str(args.get("name", "")))
+            )
+            # Give the window a moment to appear so a follow-up list_windows
+            # or focus finds it.
+            if result.get("ok"):
+                await asyncio.sleep(1.2)
+            return result
         if name == "list_windows":
             return await loop.run_in_executor(None, uia.list_windows)
         if name == "read_window":

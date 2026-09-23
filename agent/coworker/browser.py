@@ -22,7 +22,9 @@ from __future__ import annotations
 import logging
 import queue
 import re
+import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -152,6 +154,7 @@ class _State:
     channel: str = ""
     mode: str = ""
     cdp_proc: Any = None      # the Chrome we launched, if any
+    restarted: bool = False   # did we just restart the user's Chrome
     elements: list[dict] = field(default_factory=list)
 
 
@@ -219,56 +222,99 @@ def _ensure_page_profile(headless: bool):
     return _state.page
 
 
+def _cdp_up() -> bool:
+    import socket
+
+    s = socket.socket()
+    s.settimeout(0.3)
+    try:
+        s.connect(("127.0.0.1", CDP_PORT))
+        return True
+    except Exception:
+        return False
+    finally:
+        s.close()
+
+
+def _chrome_running() -> bool:
+    """Is any normal chrome.exe alive (holding the profile without the port)?"""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq chrome.exe", "/NH"],
+            capture_output=True, text=True, timeout=10,
+        ).stdout.lower()
+        return "chrome.exe" in out
+    except Exception:
+        return False
+
+
+def _close_chrome() -> None:
+    """Close every Chrome, gracefully first so it saves its session.
+
+    A running Chrome holds the profile and will swallow our debug-port launch
+    without ever opening the port, so it has to go. Graceful taskkill lets it
+    write "last session" to disk; --restore-last-session then brings the tabs
+    back when we relaunch. Force is the fallback for anything that lingers.
+    """
+    for force in (False, True):
+        cmd = ["taskkill", "/IM", "chrome.exe", "/T"]
+        if force:
+            cmd.append("/F")
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=10)
+        except Exception:
+            pass
+        deadline = time.monotonic() + 6
+        while time.monotonic() < deadline and _chrome_running():
+            time.sleep(0.3)
+        if not _chrome_running():
+            return
+
+
+def _launch_debug_chrome() -> None:
+    exe = _chrome_exe()
+    if not exe:
+        raise RuntimeError("Google Chrome topilmadi.")
+    _state.cdp_proc = subprocess.Popen(
+        [exe, f"--remote-debugging-port={CDP_PORT}",
+         f"--user-data-dir={_real_user_data()}",
+         f"--profile-directory={CHROME_PROFILE}",
+         "--restore-last-session",
+         "--no-first-run", "--no-default-browser-check"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline and not _cdp_up():
+        time.sleep(0.3)
+
+
 def _ensure_page_cdp():
     """Attach to the user's own Chrome, with their real logged-in accounts.
 
-    If a debuggable Chrome is already listening, reuse it. Otherwise launch the
-    real Chrome against the user's real profile with the debugging port, and
-    wait for it. If a normal Chrome is already holding that profile, the launch
-    cannot expose the port - Chrome is single-instance per profile - so this
-    raises with a message telling the user to close Chrome first, rather than
-    silently falling back to a profile that has none of their accounts.
+    The earlier version told the user to close Chrome by hand and then failed
+    anyway - a lingering background chrome.exe kept holding the profile, so it
+    never worked. This does the whole thing itself: if the debug port is not
+    already up, it closes any running Chrome (gracefully, so the session is
+    saved), relaunches Chrome against the real profile with the port and
+    --restore-last-session so the tabs come straight back, and attaches. No
+    manual steps.
     """
-    import socket
+    import time as _time
 
-    endpoint = f"http://127.0.0.1:{CDP_PORT}"
-
-    def _up() -> bool:
-        s = socket.socket()
-        s.settimeout(0.3)
-        try:
-            s.connect(("127.0.0.1", CDP_PORT))
-            return True
-        except Exception:
-            return False
-        finally:
-            s.close()
-
-    if not _up():
-        exe = _chrome_exe()
-        if not exe:
-            raise RuntimeError("Google Chrome topilmadi.")
-        import subprocess
-        import time
-
-        _state.cdp_proc = subprocess.Popen(
-            [exe, f"--remote-debugging-port={CDP_PORT}",
-             f"--user-data-dir={_real_user_data()}",
-             f"--profile-directory={CHROME_PROFILE}",
-             "--no-first-run", "--no-default-browser-check"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        )
-        deadline = time.monotonic() + 12
-        while time.monotonic() < deadline and not _up():
-            time.sleep(0.3)
-        if not _up():
+    _state.restarted = False
+    if not _cdp_up():
+        if _chrome_running():
+            _close_chrome()
+            _state.restarted = True
+        _launch_debug_chrome()
+        _time.sleep(1.0)                      # let the window settle
+        if not _cdp_up():
             raise RuntimeError(
-                "Chrome debug rejimida ochilmadi. Odatdagi Chrome ochiq bo'lsa, "
-                "avval uni butunlay yoping (barcha oynalar) — keyin men uni "
-                "sizning akkauntlaringiz bilan qayta ochaman."
+                "Chrome'ni debug rejimida ocholmadim. Chrome jarayoni "
+                "yopilmayotgan bo'lishi mumkin — kompyuterni qayta yuklab ko'ring."
             )
 
-    browser = _state.playwright.chromium.connect_over_cdp(endpoint)
+    browser = _state.playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
     _state.browser = browser
     _state.context = browser.contexts[0] if browser.contexts else browser.new_context()
     _state.context.set_default_timeout(NAV_TIMEOUT)
@@ -324,7 +370,11 @@ def open_url(url: str) -> dict:
         page = _ensure_page()
         page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         page.wait_for_timeout(700)          # let the usual client-side render settle
-        return _describe(page)
+        out = _describe(page)
+        if _state.restarted:
+            out["note"] = "Chrome akkauntlaringiz bilan qayta ochildi (tablar tiklandi)."
+            _state.restarted = False
+        return out
 
     return _run(job)
 

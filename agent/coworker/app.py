@@ -215,7 +215,8 @@ class CoworkerAgent:
             )
 
         if CAP_DESKTOP in caps:
-            lines = ["🪟 EKRAN", "  · «qanday dasturlar ochiq?»"]
+            lines = ["🪟 EKRAN VA DASTURLAR", "  · «qanday dasturlar ochiq?»",
+                     "  · «Telegram ni och», «Chrome ni och» — dastur ochish"]
             if CAP_DESKTOP_CONTROL in caps:
                 lines += [
                     "  · «Explorer'da qidiruvga shuni yoz»",
