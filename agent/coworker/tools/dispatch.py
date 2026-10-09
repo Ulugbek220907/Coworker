@@ -127,6 +127,7 @@ class TurnState:
     content_parts: list = field(default_factory=list)
     content_chars: int = 0
     surfaced: set = field(default_factory=set)
+    surfaced_owner: set = field(default_factory=set)
     delivered: set = field(default_factory=set)
     sendable: list = field(default_factory=list)
     end_turn: bool = False
@@ -169,6 +170,7 @@ class TurnState:
             owner_norm=normalize_text(self.owner_text),
             content_norm=normalize_text("\n".join(self.content_parts)),
             surfaced=frozenset(self.surfaced),
+            surfaced_owner=frozenset(self.surfaced_owner),
             delivered=frozenset(self.delivered),
             local_read=self.local_read,
             cancel=self.cancel,
@@ -182,7 +184,7 @@ class TurnState:
             self.content_parts.append(piece)
             self.content_chars += len(piece)
 
-    def absorb(self, spec: ToolSpec, result: ToolResult) -> None:
+    def absorb(self, spec: ToolSpec, result: ToolResult, args: Any = None) -> None:
         """Fold one tool result into the turn's taint and path state."""
         self.tool_calls += 1
         if result.ok and spec.tier == Tier.READ and spec.family in LOCAL_READ_FAMILIES and not spec.egress:
@@ -191,6 +193,11 @@ class TurnState:
             self.add_content("\n".join(text_leaves(result.to_dict())))
         for path in result.surfaced:
             self.surfaced.add(path_key(path))
+        query = args.get("query") if isinstance(args, dict) else None
+        if isinstance(query, str) and len(normalize_text(query)) >= 3 \
+                and normalize_text(query) in normalize_text(self.owner_text):
+            # The owner asked for this search in their own words, so its results are theirs.
+            self.surfaced_owner.update(path_key(p) for p in result.surfaced)
         if result.surfaced:
             self.provenance = max(self.provenance, Provenance.METADATA)
         for path in result.sendable:
@@ -332,7 +339,7 @@ class Dispatcher:
             result.untrusted = True
 
         self._outcome(intent, result.ok, result.code or ("ok" if result.ok else "failed"), result.error or "")
-        turn.absorb(spec, result)
+        turn.absorb(spec, result, args)
         return result
 
     def _freeze(self, approval_id: str, turn: TurnState) -> None:

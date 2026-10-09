@@ -118,6 +118,7 @@ EXPECTED_ROWS = {
     "key_press": ("desktop_control", Tier.LOCAL_WRITE, "INPUT"),
     "ui_click": ("desktop_control", Tier.LOCAL_WRITE, "UIA"),
     "clipboard_set": ("desktop_control", Tier.LOCAL_WRITE, "INPUT"),
+    "control_app_type": ("desktop_control", Tier.LOCAL_WRITE, "INPUT"),
     "control_app_send": ("desktop_control", Tier.OUTBOUND, "INPUT"),
 }
 
@@ -526,7 +527,8 @@ def test_control_app_send_types_then_presses_enter(monkeypatch) -> None:
                         or {"ok": True, "pressed": "enter"})
     result = run("control_app_send", {"app": "Claude Code", "text": "salom"})
     assert result.ok is True
-    assert result.data == {"app": "Claude Code", "sent": True}
+    assert result.data["app"] == "Claude Code" and result.data["sent"] is True
+    assert "verified" in result.data and "message" in result.data
     assert typed == [("salom", 9)]
     assert pressed == [("enter", 9)]
 

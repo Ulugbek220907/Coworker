@@ -46,6 +46,18 @@ def _key(value: str) -> str:
     return os.path.normcase(os.path.normpath(value))
 
 
+def _without_owner_paths(args: dict, names: tuple, ctx: CallContext) -> dict:
+    """The arguments with every path the owner's own search asked for removed, value by value."""
+    out = dict(args)
+    for name in names:
+        value = args.get(name)
+        if isinstance(value, str) and _key(value) in ctx.surfaced_owner:
+            out[name] = ""
+        elif isinstance(value, list):
+            out[name] = [v for v in value if not (isinstance(v, str) and _key(v) in ctx.surfaced_owner)]
+    return out
+
+
 def _strings(value: Any) -> list[str]:
     """The non-empty strings in an argument: a single path, or each path in a list.
 
@@ -146,7 +158,11 @@ class PolicyKernel:
         if spec.sensitive_args and ctx.content_norm and (
             spec.tier in ORIGIN_TIERS or (spec.egress and ctx.local_read)
         ):
-            atom = origin.first_content_only_atom(args, spec.sensitive_args, ctx)
+            # A path that one of this turn's searches returned is metadata the owner asked
+            # for, so it is not "copied from content" even though the search result is marked
+            # untrusted. Those arguments are checked for surfacing above, not for origin.
+            atom = origin.first_content_only_atom(_without_owner_paths(args, spec.sensitive_args, ctx),
+                                                  spec.sensitive_args, ctx)
             if atom:
                 return Verdict.deny(
                     "origin_content",

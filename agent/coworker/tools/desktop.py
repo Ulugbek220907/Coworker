@@ -253,29 +253,110 @@ def _ui_click(call: ToolCall) -> ToolResult:
 
 
 def _clipboard_set(call: ToolCall) -> ToolResult:
-    return _from_dict(keys.clipboard_set(_raw(call.args, "text")))
+    result = _from_dict(keys.clipboard_set(_raw(call.args, "text")))
+    if result.ok:
+        result.data["message"] = (
+            f"Bufer ustiga yozildi ({len(_raw(call.args, 'text'))} belgi). "
+            "Hech qaysi ilovaga yozilmadi."
+        )
+    return result
+
+
+def _text_on_screen(svc: Any, handle: int, text: str, blocked: tuple[str, ...]) -> bool | None:
+    """Whether the text is visible in the window, judged on a screenshot.
+
+    True or False is the model's yes or no about the picture; None means the check
+    could not be made (no vision model, no screenshot, no answer). A model can misjudge,
+    so a result is reported as a check, never as proof.
+    """
+    if _needs_vision(svc) is not None:
+        return None
+    loop = getattr(svc, "loop", None)
+    if loop is None or not loop.is_running():
+        return None
+    shot = vision.capture(handle, blocked=blocked)
+    if shot.get("error"):
+        return None
+    question = (
+        f"{vision.DEFAULT_PROMPT}\n\nSAVOL: bu oynada «{text[:200]}» matni kiritish maydonida "
+        "yoki yozilgan xabarda ko'rinyaptimi? Faqat HA yoki YO'Q deb javob ber."
+    )
+    try:
+        future = asyncio.run_coroutine_threadsafe(svc.llm.vision(question, shot["image_b64"]), loop)
+        answer = str(future.result(timeout=VISION_WAIT_S)).strip().lower()
+    except concurrent.futures.TimeoutError:
+        future.cancel()
+        return None
+    except Exception:
+        log.debug("on-screen check failed", exc_info=True)
+        return None
+    if answer.startswith(("ha", "yes", "да")):
+        return True
+    if answer.startswith(("yo", "no", "нет")):
+        return False
+    return None
+
+
+def _type_into_app(call: ToolCall) -> tuple[ToolResult | None, dict | None]:
+    """Find the window, type the text and check the screen. Returns (failure, found-info)."""
+    app = _text(call.args, "app")
+    text = _raw(call.args, "text")
+    if not app or not text:
+        return ToolResult.fail("arg_invalid", "ilova nomi yoki matn bo'sh"), None
+    found = uia.find_window(app)
+    if found.get("error"):
+        return _from_dict(found), None
+    handle = int(found["handle"])
+    blocked = _blocked(call.svc)
+    typed = keys.type_text(text, handle, blocked=blocked)
+    if typed.get("error"):
+        return _from_dict(typed), None
+    visible = _text_on_screen(call.svc, handle, text, blocked)
+    return None, {"handle": handle, "title": found["title"], "visible": visible, "blocked": blocked}
+
+
+def _control_app_type(call: ToolCall) -> ToolResult:
+    failure, info = _type_into_app(call)
+    if failure is not None:
+        return failure
+    title, visible = info["title"], info["visible"]
+    if visible is False:
+        return ToolResult.fail(
+            "not_verified",
+            f"Matn «{title}» oynasiga yozilgan deb hisoblanmadi: ekranda ko'rinmadi.",
+            app=title, verified=False,
+        )
+    if visible is True:
+        message = f"Matn «{title}» oynasiga yozildi va ekranda tekshirildi. Enter bosilmadi."
+    else:
+        message = f"Matn «{title}» oynasiga yozildi; ekranda tekshirib bo'lmadi. Enter bosilmadi."
+    return ToolResult(ok=True, data={"app": title, "typed": True, "verified": visible, "message": message})
 
 
 def _control_app_send(call: ToolCall) -> ToolResult:
-    app = _text(call.args, "app")
-    if not app:
-        return ToolResult.fail("arg_invalid", "ilova nomi bo'sh")
-    found = uia.find_window(app)
-    if found.get("error"):
-        return _from_dict(found)
-    handle = int(found["handle"])
-    blocked = _blocked(call.svc)
-    typed = keys.type_text(_raw(call.args, "text"), handle, blocked=blocked)
-    if typed.get("error"):
-        return _from_dict(typed)
-    pressed = keys.press("enter", handle, blocked=blocked)
+    failure, info = _type_into_app(call)
+    if failure is not None:
+        return failure
+    title, visible = info["title"], info["visible"]
+    if visible is False:
+        # Enter is not pressed when the text is not on the screen: nothing is sent blind.
+        return ToolResult.fail(
+            "not_verified",
+            f"Matn «{title}» oynasida ko'rinmadi, shuning uchun Enter bosilmadi.",
+            app=title, verified=False,
+        )
+    pressed = keys.press("enter", info["handle"], blocked=info["blocked"])
     if pressed.get("error"):
         return ToolResult.fail(
             str(pressed.get("code", "")),
             f"Matn yozildi, lekin Enter bosilmadi: {pressed['error']}",
-            app=found["title"], typed=True,
+            app=title, typed=True,
         )
-    return ToolResult(ok=True, data={"app": found["title"], "sent": True})
+    if visible is True:
+        message = f"Xabar «{title}» oynasiga yuborildi (Enter); matn ekranda tekshirildi."
+    else:
+        message = f"Xabar «{title}» oynasiga yuborildi (Enter); ekranda tekshirib bo'lmadi."
+    return ToolResult(ok=True, data={"app": title, "sent": True, "verified": visible, "message": message})
 
 
 # ----------------------------------------------------- relax and arg checks
@@ -445,6 +526,10 @@ def _summary_app_send(args: dict) -> str:
     return f"«{_text(args, 'app')}» ilovasiga yuboriladi: «{_raw(args, 'text')}» — Enter bilan"
 
 
+def _summary_app_type(args: dict) -> str:
+    return f"«{_text(args, 'app')}» ilovasiga yoziladi (Enter bosilmaydi): «{_raw(args, 'text')}»"
+
+
 # ------------------------------------------------------------------ schema
 
 def _schema(properties: dict, required: tuple[str, ...] = ()) -> dict:
@@ -549,12 +634,24 @@ SPECS: list[ToolSpec] = [
     ToolSpec(
         name="clipboard_set", family="desktop_control", tier=Tier.LOCAL_WRITE,
         description=(
-            "Put text on the clipboard. What it held before is replaced, not kept. Text copied "
-            "from a page or document is refused."
+            "Put text on the clipboard ONLY. It does not type into any app: to write text into an "
+            "app's input box use control_app_type. What the clipboard held before is replaced. "
+            "Text copied from a page or document is refused."
         ),
         parameters=_schema({"text": _TEXT}, ("text",)),
         handler=_clipboard_set, gov_class="INPUT", timeout_s=20,
         sensitive_args=("text",), arg_checks=(check_text_origin,), summary=_summary_clipboard_set,
+    ),
+    ToolSpec(
+        name="control_app_type", family="desktop_control", tier=Tier.LOCAL_WRITE,
+        description=(
+            "Type text into an app window's input box (exact title from list_windows) WITHOUT "
+            "pressing Enter, then check the screen that the text is there. Use this to write "
+            "into an app; the owner decides when to send."
+        ),
+        parameters=_schema({"app": _TITLE, "text": _TEXT}, ("app", "text")),
+        handler=_control_app_type, gov_class="INPUT", timeout_s=60,
+        sensitive_args=("text",), arg_checks=(check_text_origin,), summary=_summary_app_type,
     ),
     ToolSpec(
         name="control_app_send", family="desktop_control", tier=Tier.OUTBOUND,

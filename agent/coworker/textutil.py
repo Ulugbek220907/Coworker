@@ -110,12 +110,16 @@ def stem(word: str) -> str:
 
 
 def tokens(text: str, *, do_stem: bool = True) -> list[str]:
-    """Normalised word list, deduplicated, stopwords removed."""
-    words = _WORD.findall(normalize(text))
+    """Normalised word list, deduplicated, stopwords removed.
+
+    A name made only of filler words is still a name: a folder called "Ok" or a
+    query "ha" keeps its words. Dropping them left such names empty, and an empty
+    name matches nothing, so the folder could never be found.
+    """
+    words = [w for w in _WORD.findall(normalize(text)) if len(w) >= 2]
+    kept = [w for w in words if w not in STOPWORDS] or words
     out, seen = [], set()
-    for w in words:
-        if w in STOPWORDS or len(w) < 2:
-            continue
+    for w in kept:
         w = stem(w) if do_stem else w
         if w not in seen:
             seen.add(w)

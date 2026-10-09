@@ -4,10 +4,12 @@ The agent kept claiming it could open programs and then could not: there was no
 tool for it. This is that tool.
 
 Shortcuts come from the Start Menu and the desktop, where Windows itself looks.
-Matching reuses the cross-script scorer the file search uses, so "telegram",
-"телеграм" and a partial name all resolve. Launching is os.startfile on the
-shortcut, the same thing a double-click does, so the app keeps its own arguments
-and working directory.
+Matching is by words, not by a score. A name resolves to a shortcut only when it
+is that shortcut's full name (ignoring case, punctuation and spaces, and reading
+Cyrillic as Latin, so "телеграм" is "telegram") or a declared alias of an installed
+shortcut. A partial name is never started: it becomes a list the owner chooses
+from. Launching is os.startfile on the shortcut, the same thing a double-click
+does, so the app keeps its own arguments and working directory.
 
 The index is a trust boundary. open_app runs without a tap when resolve_exact
 finds the name in it, so an entry that starts a shell, an interpreter or a script
@@ -34,7 +36,7 @@ import subprocess
 import time
 import unicodedata
 
-from .textutil import normalize, score
+from .textutil import normalize
 
 log = logging.getLogger("launcher")
 
@@ -103,7 +105,12 @@ def _words(text: str) -> list[str]:
     return re.findall(r"[^\W_]+", normalize(visible))
 
 
-_PHRASES = tuple(" ".join(_words(p)) for p in _REFUSED_PHRASES)
+def _key(text: str) -> str:
+    """The comparison form of a name: its words, lower-cased and joined by single spaces."""
+    return " ".join(_words(text))
+
+
+_PHRASES = tuple(_key(p) for p in _REFUSED_PHRASES)
 
 
 def refusal_code(query: str) -> str | None:
@@ -195,71 +202,170 @@ def _index() -> dict[str, str]:
 
 # ------------------------------------------------------------------ matching
 
+# A partial name must offer at least this many letters. "tel" finds Telegram; "a" and
+# "e" find nothing, which is why they once started notepad through a substring test.
+_MIN_PARTIAL = 3
+
+# Words an owner says for "any browser" or "any program". They name a category, not a
+# shortcut, so they never resolve to one: "open browser" must not start whichever
+# program happens to contain the word. The browser is looked up with default_browser.
+_CATEGORY_NAMES = frozenset(_key(w) for w in (
+    "browser", "web browser", "internet browser", "browsers", "brauzer",
+    "app", "apps", "application", "applications", "program", "programs", "dastur", "ilova",
+))
+
+# A product an owner names by a shorter or different title than its shortcut, or whose
+# first word is shared with another shortcut ("Chrome" is also Chrome Remote Desktop).
+# An alias resolves only to a shortcut that is installed; it never invents one.
+_ALIASES = {_key(a): _key(b) for a, b in (
+    ("chrome", "Google Chrome"),
+    ("edge", "Microsoft Edge"),
+    ("ms edge", "Microsoft Edge"),
+)}
+
+
+def _word_matches(query_word: str, name_word: str) -> bool:
+    """True when one query word names one word of a shortcut.
+
+    Equal words match. A query word of at least _MIN_PARTIAL letters matches a longer
+    word it begins. A query word of five or more letters also matches inside a joined
+    word, so "office" finds "OpenOffice".
+    """
+    if query_word == name_word:
+        return True
+    if len(query_word) < _MIN_PARTIAL:
+        return False
+    return name_word.startswith(query_word) or (len(query_word) >= 5 and query_word in name_word)
+
+
+def _candidates(query: str) -> list[tuple[float, str, str]]:
+    """Every shortcut whose words cover every word of the query, best first.
+
+    A shortcut that begins with the whole query ranks above one that merely contains
+    its words. A query made only of words shorter than _MIN_PARTIAL covers nothing.
+    """
+    key = _key(query)
+    words = key.split()
+    if not words or key in _CATEGORY_NAMES or not any(len(w) >= _MIN_PARTIAL for w in words):
+        return []
+    found: list[tuple[float, str, str]] = []
+    for name, path in _index().items():
+        name_key = _key(name)
+        name_words = name_key.split()
+        if not name_words:
+            continue
+        if all(any(_word_matches(w, nw) for nw in name_words) for w in words):
+            rank = 0.95 if name_key.startswith(key) else 0.8
+            found.append((rank, name, path))
+    found.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    return found
+
+
 def find(query: str, limit: int = 5) -> list[dict]:
-    """Ranked shortcut matches for a spoken app name. A refused query matches nothing."""
+    """Shortcuts that could be the program the owner means. Listing only: nothing is started.
+
+    A refused query matches nothing.
+    """
     if refusal_code(query):
         return []
-    scored = []
-    q = normalize(query)
-    for name, path in _index().items():
-        s = score(query, name)
-        # A clean prefix or substring match is worth a lot for app names, which are
-        # short and distinctive ("telegram" -> "Telegram").
-        n = normalize(name)
-        if n == q:
-            s = 1.0
-        elif n.startswith(q) or q in n:
-            s = max(s, 0.9)
-        if s >= 0.4:
-            scored.append((s, name, path))
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [{"name": n, "path": p, "score": round(s, 2)} for s, n, p in scored[:limit]]
+    return [
+        {"name": name, "path": path, "score": round(rank, 2)}
+        for rank, name, path in _candidates(query)[:limit]
+    ]
+
+
+def _result(status: str, options: list[str] | None = None) -> dict:
+    return {"status": status, "name": None, "path": None, "options": list(options or [])}
+
+
+def _exact(name: str, index: dict[str, str]) -> dict:
+    return {"status": "exact", "name": name, "path": index[name], "options": []}
+
+
+def resolve(query: str) -> dict:
+    """Decide which installed application the owner's words name, or why that is not possible.
+
+    The status is one of:
+
+      'exact'    the words are one shortcut's full name, or a declared alias of an
+                 installed shortcut. This is the only status that may start anything.
+      'choose'   several shortcuts are plausible and none is exact. ``options`` holds up
+                 to four names for the owner to pick from.
+      'none'     nothing is plausible, including a category word such as "browser".
+      'refused'  refusal_code(query) is set: a shell, an interpreter, a script host or
+                 an empty name.
+
+    Ties are broken by the name alone. The text as typed wins when it is one shortcut's
+    name; a normalised name that equals exactly one shortcut's name wins over longer
+    shortcuts that merely contain it. Two shortcuts with the same normalised name are a
+    choice, never a guess. Nothing is guessed.
+    """
+    if refusal_code(query):
+        return _result("refused")
+    key = _key(query)
+    if not key or key in _CATEGORY_NAMES:
+        return _result("none")
+    index = _index()
+
+    # The text exactly as typed separates "Old-Tool" from "Old Tool" when both are installed.
+    raw = query.strip()
+    if raw in index:
+        return _exact(raw, index)
+
+    same = [name for name in index if _key(name) == key]
+    if len(same) == 1:
+        return _exact(same[0], index)
+    if len(same) > 1:
+        return _result("choose", sorted(same)[:4])
+
+    target = _ALIASES.get(key)
+    if target is not None:
+        named = [name for name in index if _key(name) == target]
+        if len(named) == 1:
+            return _exact(named[0], index)
+
+    candidates = _candidates(query)
+    if not candidates:
+        return _result("none")
+    return _result("choose", [name for _, name, _ in candidates][:4])
 
 
 def resolve_exact(name: str) -> dict | None:
-    """The indexed shortcut whose display name equals ``name`` after normalisation, or None.
+    """The shortcut when resolve(name) is 'exact', otherwise None.
 
-    This is the only lookup open_app may relax on: a partial or fuzzy name is never
-    enough to skip the owner's tap.
+    open_app relaxes its confirmation only on an exact result, so a partial or fuzzy
+    name never skips the owner's tap.
     """
-    if refusal_code(name):
+    res = resolve(name)
+    if res["status"] != "exact":
         return None
-    key = normalize(name)
-    for display, path in _index().items():
-        if normalize(display) == key:
-            return {"name": display, "path": path}
-    return None
+    return {"name": res["name"], "path": res["path"]}
 
 
 # --------------------------------------------------------------------- launch
 
 def launch(query: str) -> dict:
-    """Open the best-matching application.
+    """Start the application the owner named, and only that one.
 
-    An exact shortcut name always wins. A close second is not guessed at: the
-    candidates come back and nothing is launched.
+    Only an 'exact' resolution starts. A 'choose' result returns its options and
+    launches nothing, so a partial name is never taken for the program meant. The
+    built-in table is consulted only when resolve() finds no shortcut at all.
     """
     if os.name != "nt":
         return {"error": "Faqat Windows"}
-    code = refusal_code(query)
-    if code:
+    res = resolve(query)
+    if res["status"] == "refused":
+        code = refusal_code(query) or "arg_invalid"
         return {"error": _REFUSAL_TEXT[code], "code": code}
+    if res["status"] == "exact":
+        return _start(res["path"], res["name"])
+    if res["status"] == "choose":
+        return {"ambiguous": True, "options": res["options"], "query": query}
 
-    exact = resolve_exact(query)
-    if exact is not None:
-        return _start(exact["path"], exact["name"])
-
-    matches = find(query, limit=5)
-    if not matches:
-        sys_result = _launch_system(query)
-        if sys_result is not None:
-            return sys_result
-        return {"error": f"«{query}» nomli dastur topilmadi.", "code": "arg_invalid"}
-
-    best = matches[0]
-    if len(matches) > 1 and best["score"] - matches[1]["score"] < 0.12 and best["score"] < 0.95:
-        return {"ambiguous": True, "options": [m["name"] for m in matches[:4]], "query": query}
-    return _start(best["path"], best["name"])
+    sys_result = _launch_system(query)
+    if sys_result is not None:
+        return sys_result
+    return {"error": f"«{query}» nomli dastur topilmadi.", "code": "not_found"}
 
 
 def _start(path: str, name: str) -> dict:
@@ -270,13 +376,20 @@ def _start(path: str, name: str) -> dict:
     return {"ok": True, "opened": name}
 
 
+_SYSTEM_MIN_LEN = 4
+
+
 def _launch_system(query: str) -> dict | None:
-    """Open a built-in Windows app from the fixed table. None when the name is not in it."""
-    q = normalize(query)
-    target = next(
-        (cmd for name, cmd in _SYSTEM_APPS.items() if normalize(name) == q or q in normalize(name)),
-        None,
-    )
+    """Open a built-in Windows app from the fixed table. None when the name is not in it.
+
+    The whole query must equal a table name or alias, and be at least four letters.
+    A substring test once let "a" or "e" start notepad, and a word inside a longer
+    phrase must not start a system tool either.
+    """
+    key = _key(query)
+    if len(key) < _SYSTEM_MIN_LEN:
+        return None
+    target = next((cmd for name, cmd in _SYSTEM_APPS.items() if _key(name) == key), None)
     if target is None:
         return None
     try:

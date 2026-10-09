@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import threading
+import time
+import unicodedata
 from typing import Any, Callable, Optional
 
 from .config import Config, config_dir
@@ -27,7 +30,7 @@ from .orchestrator.turn import TIME_SCHEDULED
 from .policy.kernel import PolicyKernel
 from .safety import ApprovalBroker, KillSwitch, Pairing
 from .scheduler import Scheduler
-from .store import Store
+from .store import Approval, Store
 from .store.secrets import get_secret
 from .stt import Transcriber
 from .tools.dispatch import Dispatcher
@@ -48,6 +51,22 @@ FORWARD_FIELDS = ("forward_origin", "forward_from", "forward_from_chat", "forwar
                   "forward_date", "forward_signature")
 LOCAL_WAIT_TEXT = ("🖥 Telegramda «Ha» bosildi. Bu amal kompyuterda ham tasdiqlanishi kerak; "
                    "u tasdiqlangach, «Ha» ni yana bosing.")
+
+# A typed yes or no while an approval card waits. These words choose a fixed reply and
+# never run anything: a yes points the owner at the card's buttons, and a no declines
+# the card the same way its No button does. Only a message that is exactly one of these
+# words counts, so a word inside a longer one ("shunday", "hayot") or a message that
+# also asks for something ("ha, lekin boshqacha") is an ordinary turn.
+ANSWER_YES = "yes"
+ANSWER_NO = "no"
+YES_REPLY = "Tasdiqlash uchun kartadagi tugmani bosing."
+EXPIRED_REPLY = "Tasdiqlash muddati tugagan. Qaytadan so'rang."
+CARD_HEADING = "⚠️ Tasdiq kerak:"
+_YES_WORDS = ("ha", "ok", "yes", "да", "ҳа", "da")
+_NO_WORDS = ("yo'q", "no", "нет", "йўқ", "net")
+# Apostrophe forms are dropped before splitting, so "yo'q", "yo’q" and "yoq" are one word.
+_APOSTROPHES = str.maketrans("", "", "'’ʼʻ`‘")
+_WORD = re.compile(r"[^\W_]+")
 
 HELP_TEXT = (
     "🤖 Men kompyuteringizdaman. Oddiy tilda yozing yoki ovozli xabar yuboring.\n\n"
@@ -215,6 +234,10 @@ class Runtime:
         name, args = (None, "") if forwarded else commands.parse(text)
         if name:
             reply = await self._command(name, args, chat_id)
+        elif not forwarded and await self._answer_card(msg, chat_id, text):
+            # A yes or no for a waiting card is answered here, so it never reaches the model
+            # as a new request. The card sends its own replies.
+            return
         elif self.llm is None:
             reply = Reply("⚠️ AI sozlanmagan. Sozlamalarda model va kalitni kiriting.")
         elif forwarded:
@@ -278,6 +301,36 @@ class Runtime:
             return await self.orchestrator.run_approved(approval_id, nonce, actor, owner_id)
         return self.orchestrator.decline(approval_id, nonce, actor, owner_id)
 
+    async def _answer_card(self, msg: dict, chat_id: int, text: str) -> bool:
+        """Answer a typed yes or no given while an approval card waits. True when it was one.
+
+        A yes approves nothing: it sends the card again, with the same buttons, so the
+        owner taps there. A no declines the card through the same rule the No button
+        uses. A card that has expired gets its own reply, and its buttons are removed.
+        Any other text returns False and becomes an ordinary turn; the card stays pending.
+        """
+        answer = approval_answer(text)
+        if answer is None:
+            return False
+        now = time.time()
+        card = _card_to_answer(self.store.approvals_pending(chat_id), now)
+        if card is None:
+            return False
+        if card.expires_at <= now:
+            await self._strip_cards(chat_id, card.id)
+            await self._say(chat_id, EXPIRED_REPLY)
+            return True
+        if answer == ANSWER_YES:
+            await self._say(chat_id, YES_REPLY)
+            await self._reply(chat_id, Reply(_card_text(card.summary), self.approvals.buttons(card), card.id))
+            return True
+        owner = self.pairing.owner()
+        actor = int((msg.get("from") or {}).get("id", 0))
+        reply = self.orchestrator.decline(card.id, card.nonce, actor, owner[0] if owner else None)
+        await self._strip_cards(chat_id, card.id)
+        await self._reply(chat_id, reply)
+        return True
+
     # ---------------------------------------------------------------- commands
 
     async def _command(self, name: str, args: str, chat_id: int) -> Reply:
@@ -337,16 +390,43 @@ class Runtime:
     async def _reply(self, chat_id: int, reply: Reply) -> None:
         if not reply.text and not reply.buttons:
             return
-        await self._send(chat_id, reply.text, reply.buttons or None)
+        sent = await self._send(chat_id, reply.text, reply.buttons or None)
+        if reply.approval_id:
+            self._remember_card(reply.approval_id, sent)
 
     async def _say(self, chat_id: int, text: str) -> None:
         await self._send(chat_id, text, None)
 
-    async def _send(self, chat_id: int, text: str, buttons: Any) -> None:
+    async def _send(self, chat_id: int, text: str, buttons: Any) -> dict | None:
         if self.outbox is None:
             log.warning("no Telegram connection; reply dropped")
+            return None
+        return await asyncio.to_thread(self.outbox.text, chat_id, text, buttons)
+
+    def _remember_card(self, approval_id: str, sent: Any) -> None:
+        """Keep the Telegram message that holds a card's buttons, so a typed answer can remove them.
+
+        A tap reports the message it was pressed on; a typed answer reports nothing, so
+        the ids are kept here. Every copy is kept, because a re-sent card has live buttons too.
+        """
+        message_id = _sent_message_id(sent)
+        if message_id is not None:
+            self.store.kv_set(_card_key(approval_id), [*self._card_messages(approval_id), message_id])
+
+    def _card_messages(self, approval_id: str) -> list[int]:
+        raw = self.store.kv_get(_card_key(approval_id), [])
+        return [int(m) for m in raw] if isinstance(raw, list) else []
+
+    async def _strip_cards(self, chat_id: int, approval_id: str) -> None:
+        """Remove the buttons of every message that carries this card, then forget them."""
+        message_ids = self._card_messages(approval_id)
+        if not message_ids:
             return
-        await asyncio.to_thread(self.outbox.text, chat_id, text, buttons)
+        self.store.kv_set(_card_key(approval_id), [])
+        if self.outbox is None:
+            return
+        for message_id in message_ids:
+            await asyncio.to_thread(self.outbox.edit_markup, chat_id, message_id)
 
     def _deliver(self, chat_id: int, text: str) -> bool:
         """Scheduler callback, on the scheduler thread. True only when Telegram accepted the text."""
@@ -401,6 +481,62 @@ def _job_state(job: dict) -> str:
 
 def is_forwarded(msg: dict) -> bool:
     return any(field in msg for field in FORWARD_FIELDS)
+
+
+def _folded_words(text: str) -> list[str]:
+    """The words of a text, lowercased, with apostrophes dropped and punctuation split off."""
+    folded = unicodedata.normalize("NFC", text).casefold().translate(_APOSTROPHES)
+    return _WORD.findall(folded)
+
+
+_YES_SET = frozenset(w for word in _YES_WORDS for w in _folded_words(word))
+_NO_SET = frozenset(w for word in _NO_WORDS for w in _folded_words(word))
+
+
+def approval_answer(text: str) -> str | None:
+    """ANSWER_YES or ANSWER_NO when the whole message is one answer word; None for anything else.
+
+    The message must be a single word. Matching is on whole words, so a yes word inside a
+    longer word never counts. Case and Unicode form are normalised first.
+    """
+    words = _folded_words(text or "")
+    if len(words) != 1:
+        return None
+    if words[0] in _YES_SET:
+        return ANSWER_YES
+    if words[0] in _NO_SET:
+        return ANSWER_NO
+    return None
+
+
+def _card_to_answer(pending: list[Approval], now: float) -> Approval | None:
+    """The card a typed answer refers to: the newest that is still open, else the newest of all.
+
+    ``pending`` comes oldest first. The newest open card is the one the owner was last
+    shown. When every card has expired, the newest is named, so the owner is told why
+    nothing ran.
+    """
+    live = [card for card in pending if card.expires_at > now]
+    chosen = live or pending
+    return chosen[-1] if chosen else None
+
+
+def _card_text(summary: str) -> str:
+    """The text of an approval card. It is the text the orchestrator sends for a new card."""
+    return f"{CARD_HEADING}\n{summary}"
+
+
+def _card_key(approval_id: str) -> str:
+    return f"approval_cards:{approval_id}"
+
+
+def _sent_message_id(sent: Any) -> int | None:
+    """The Telegram message id of a send that succeeded, or None."""
+    if not isinstance(sent, dict) or not sent.get("ok"):
+        return None
+    result = sent.get("result")
+    value = result.get("message_id") if isinstance(result, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
 def _log_failure(future: Any) -> None:

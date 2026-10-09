@@ -178,6 +178,17 @@ class Outbox:
         self._api.edit_reply_markup(chat_id, int(live["message_id"]))
         self._store.kv_set(options_key(chat_id), {})
 
+    def edit_markup(self, chat_id: int, message_id: int) -> dict:
+        """Remove the buttons from one message in the owner's chat.
+
+        The same owner check as a send applies. Removing buttons changes what the
+        owner sees, so it is refused for any other chat before the network is touched.
+        """
+        refused = self._refuse(chat_id)
+        if refused:
+            return refused
+        return self._api.edit_reply_markup(chat_id, int(message_id))
+
     def document(self, chat_id: int, path: str, caption: str = "") -> dict:
         refused = self._refuse(chat_id)
         if refused:

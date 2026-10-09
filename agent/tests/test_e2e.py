@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-from coworker import launcher
+from coworker import launcher, uia
 from coworker.config import Config
 from coworker.core.ports import PowerState
 from coworker.llm_base import STOP_END, STOP_TOOL, ToolCallReq, Turn
@@ -183,6 +183,33 @@ def test_a_tool_call_runs_and_its_result_reaches_the_model(runtime):
 
 
 def test_a_risky_action_becomes_a_card_and_only_the_tap_runs_it_once(runtime, monkeypatch):
+    # window_close is never relaxed, so it always waits for the owner's tap.
+    closed: list[int] = []
+
+    def fake_close(handle: int) -> dict:
+        closed.append(handle)
+        return {"ok": True, "closed": "Notepad"}
+
+    monkeypatch.setattr(uia, "close_window", fake_close)
+    rt = runtime([_tool("window_close", {"handle": 9}), _say("Yopildi.")])
+    _pair(rt)
+
+    asyncio.run(rt._on_message(_message("oynani yop")))
+    card = rt.api.sent[-1]
+    assert card["text"].startswith("⚠️ Tasdiq kerak"), card["text"]
+    assert closed == [], "nothing runs before the owner taps"
+    approve = next(b["callback_data"] for row in card["buttons"] for b in row
+                   if b["callback_data"].endswith(":y"))
+
+    asyncio.run(rt._on_callback(_callback(approve)))
+    assert closed == [9]
+
+    asyncio.run(rt._on_callback(_callback(approve, message_id=6)))
+    assert closed == [9], "a replayed tap must not run the action again"
+    assert "eskirgan" in rt.api.sent[-1]["text"]
+
+
+def test_an_unknown_app_name_is_refused_before_any_card_and_nothing_starts(runtime, monkeypatch):
     launched: list[str] = []
 
     def fake_launch(query: str) -> dict:
@@ -190,22 +217,15 @@ def test_a_risky_action_becomes_a_card_and_only_the_tap_runs_it_once(runtime, mo
         return {"ok": True, "started": query}
 
     monkeypatch.setattr(launcher, "launch", fake_launch)
-    rt = runtime([_tool("open_app", {"name": "zzqqnoapp"}), _say("Ochildi.")])
+    rt = runtime([_tool("open_app", {"name": "zzqqnoapp"}), _say("Topilmadi.")])
     _pair(rt)
 
     asyncio.run(rt._on_message(_message("zzqqnoapp ni och")))
-    card = rt.api.sent[-1]
-    assert card["text"].startswith("⚠️ Tasdiq kerak"), card["text"]
-    assert launched == [], "nothing runs before the owner taps"
-    approve = next(b["callback_data"] for row in card["buttons"] for b in row
-                   if b["callback_data"].endswith(":y"))
-
-    asyncio.run(rt._on_callback(_callback(approve)))
-    assert launched == ["zzqqnoapp"]
-
-    asyncio.run(rt._on_callback(_callback(approve, message_id=6)))
-    assert launched == ["zzqqnoapp"], "a replayed tap must not run the action again"
-    assert "eskirgan" in rt.api.sent[-1]["text"]
+    assert not rt.api.sent[-1]["text"].startswith("⚠️ Tasdiq kerak"), "no card for an unknown name"
+    assert launched == [], "nothing starts for a name that resolves to no installed application"
+    provider = rt.orchestrator.svc.llm
+    second_request = provider.requests[1]
+    assert any(getattr(m, "role", "") == "tool" and "not_found" in (m.content or "") for m in second_request)
 
 
 def test_panic_stops_a_tool_call_before_it_runs(runtime):
@@ -227,3 +247,28 @@ def test_a_stranger_cannot_reach_a_command_or_a_card(runtime):
     stranger = {"message": _message("/panic", from_id=STRANGER, chat_id=STRANGER)}
     assert rt.gate.allows(stranger) is False
     assert rt.kill.is_panic() is False
+
+
+def test_a_tap_lets_the_same_request_go_on(runtime, monkeypatch):
+    """The tap runs one step; the model is then told what ran, so the remaining steps can follow."""
+    closed: list[int] = []
+
+    def fake_close(handle: int) -> dict:
+        closed.append(handle)
+        return {"ok": True, "closed": "Notepad"}
+
+    monkeypatch.setattr(uia, "close_window", fake_close)
+    rt = runtime([_tool("window_close", {"handle": 9}), _say("Oynani yopdim, endi qolgan ishni qilaman.")])
+    _pair(rt)
+
+    asyncio.run(rt._on_message(_message("oynani yop, keyin xabar yoz")))
+    card = rt.api.sent[-1]
+    approve = next(b["callback_data"] for row in card["buttons"] for b in row
+                   if b["callback_data"].endswith(":y"))
+    asyncio.run(rt._on_callback(_callback(approve)))
+
+    assert closed == [9]
+    provider = rt.orchestrator.svc.llm
+    continuation = provider.requests[-1]
+    notes = [m.content or "" for m in continuation if getattr(m, "role", "") == "user"]
+    assert any("Tasdiqlangan amal bajarildi" in n for n in notes), notes

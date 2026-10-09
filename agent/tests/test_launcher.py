@@ -213,7 +213,7 @@ def test_unknown_name_never_consults_path(start_menu, started, popened, monkeypa
 
     monkeypatch.setattr(shutil, "which", forbidden)
     result = launcher.launch("zzqxv unknown program")
-    assert result["code"] == "arg_invalid"
+    assert result["code"] == "not_found"
     assert started == [] and popened == []
 
 
@@ -274,3 +274,134 @@ def test_the_index_keeps_a_distribution_shortcut_out(start_menu: Path) -> None:
     indexed = launcher._scan((str(start_menu),))
     assert "Notes" in indexed
     assert "Terminal" not in indexed
+
+
+# ------------------------------------------------------- resolve: exact names
+
+def test_full_name_resolves_exactly(start_menu):
+    path = _lnk(start_menu, "Telegram")
+    _lnk(start_menu, "Telegram Desktop")
+    assert launcher.resolve("Telegram") == {
+        "status": "exact", "name": "Telegram", "path": str(path), "options": [],
+    }
+
+
+def test_cyrillic_name_resolves_to_the_latin_shortcut(start_menu):
+    path = _lnk(start_menu, "Telegram")
+    res = launcher.resolve("Телеграм")
+    assert res["status"] == "exact" and res["path"] == str(path)
+
+
+def test_the_text_as_typed_breaks_a_tie_between_punctuated_names(start_menu):
+    path = _lnk(start_menu, "Old-Tool")
+    _lnk(start_menu, "Old Tool")
+    res = launcher.resolve("Old-Tool")
+    assert res["status"] == "exact" and res["path"] == str(path)
+
+
+def test_names_that_normalise_alike_are_a_choice_not_a_guess(start_menu):
+    _lnk(start_menu, "Old-Tool")
+    _lnk(start_menu, "Old Tool")
+    res = launcher.resolve("old tool")
+    assert res["status"] == "choose"
+    assert sorted(res["options"]) == ["Old Tool", "Old-Tool"]
+    assert res["name"] is None and res["path"] is None
+
+
+def test_the_exact_name_wins_over_a_longer_name_that_starts_with_it(start_menu):
+    path = _lnk(start_menu, "Chrome")
+    _lnk(start_menu, "Chrome Remote Desktop")
+    res = launcher.resolve("chrome")
+    assert res["status"] == "exact" and res["path"] == str(path)
+
+
+def test_chrome_is_declared_as_google_chrome_not_chrome_remote_desktop(start_menu, started):
+    chrome = _lnk(start_menu, "Google Chrome")
+    _lnk(start_menu, "Chrome Remote Desktop")
+    assert launcher.resolve("Chrome") == {
+        "status": "exact", "name": "Google Chrome", "path": str(chrome), "options": [],
+    }
+    assert launcher.launch("Chrome") == {"ok": True, "opened": "Google Chrome"}
+    assert started == [str(chrome)]
+
+
+def test_an_alias_never_invents_a_shortcut(start_menu, started):
+    _lnk(start_menu, "Chrome Remote Desktop")
+    res = launcher.resolve("chrome")
+    assert res["status"] == "choose" and res["options"] == ["Chrome Remote Desktop"]
+    assert launcher.launch("chrome") == {
+        "ambiguous": True, "options": ["Chrome Remote Desktop"], "query": "chrome",
+    }
+    assert started == []
+
+
+# ------------------------------------------------- resolve: partial names
+
+def test_a_partial_name_is_offered_and_never_started(start_menu, started):
+    _lnk(start_menu, "Telegram Desktop")
+    res = launcher.resolve("Telegram")
+    assert res["status"] == "choose" and res["options"] == ["Telegram Desktop"]
+    assert launcher.launch("Telegram") == {
+        "ambiguous": True, "options": ["Telegram Desktop"], "query": "Telegram",
+    }
+    assert started == []
+
+
+def test_choices_are_capped_at_four_options(start_menu):
+    for name in ("Office One", "Office Two", "Office Three", "Office Four", "Office Five"):
+        _lnk(start_menu, name)
+    res = launcher.resolve("office")
+    assert res["status"] == "choose" and len(res["options"]) == 4
+
+
+def test_a_longer_word_can_be_found_inside_a_joined_name(start_menu):
+    _lnk(start_menu, "OpenOffice Writer")
+    assert [m["name"] for m in launcher.find("office")] == ["OpenOffice Writer"]
+    assert launcher.resolve("office")["status"] == "choose"
+
+
+def test_a_name_with_an_unrelated_word_is_none(start_menu):
+    _lnk(start_menu, "Telegram")
+    assert launcher.resolve("Telegram Web")["status"] == "none"
+    assert launcher.resolve("Photoshop")["status"] == "none"
+
+
+def test_find_lists_candidates_without_starting_any(start_menu, started):
+    _lnk(start_menu, "Telegram Desktop")
+    _lnk(start_menu, "Telemost")
+    names = sorted(m["name"] for m in launcher.find("tel"))
+    assert names == ["Telegram Desktop", "Telemost"]
+    assert started == []
+
+
+# ------------------------------------------------------ categories and shorts
+
+@pytest.mark.parametrize("query", ["browser", "Browser", "web browser", "brauzer", "Браузер", "open browser"])
+def test_browser_is_a_category_and_never_a_program(start_menu, started, query):
+    _lnk(start_menu, "Firefox Browser")
+    _lnk(start_menu, "Google Chrome")
+    assert launcher.resolve(query)["status"] == "none"
+    assert launcher.find(query) == []
+    assert launcher.launch(query)["code"] == "not_found"
+    assert started == []
+
+
+@pytest.mark.parametrize("query", ["a", "e", "A", " e "])
+def test_short_queries_start_nothing_from_a_non_empty_index(start_menu, started, popened, query):
+    _lnk(start_menu, "Telegram")
+    _lnk(start_menu, "Notes")
+    assert launcher.resolve(query)["status"] == "none"
+    assert launcher.launch(query)["code"] == "not_found"
+    assert started == [] and popened == []
+
+
+def test_a_fragment_of_a_builtin_name_starts_nothing(start_menu, popened):
+    assert launcher.launch("note")["code"] == "not_found"
+    assert launcher.launch("calc")["ok"] is True
+    assert popened == [["calc.exe"]]
+
+
+@pytest.mark.parametrize("query", ["cmd", "powershell", "", "   "])
+def test_resolve_refuses_shells_and_empty_names(start_menu, query):
+    _lnk(start_menu, "Telegram")
+    assert launcher.resolve(query)["status"] == "refused"

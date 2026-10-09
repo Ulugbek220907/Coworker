@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from coworker import launcher, uia
-from coworker.core.types import Autonomy, CallContext, Provenance, Tier
+from coworker.core.types import Autonomy, CallContext, Decision, Provenance, Tier
 from coworker.system import WindowVisualState
 from coworker.tools import apps
 from coworker.tools.registry import Registry, Services, ToolCall, validate_args
@@ -21,6 +21,7 @@ pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="the launcher is
 # Section 3 of docs/architecture-v2.md, the apps rows.
 SECTION_3_TIERS = {
     "open_app": Tier.SYSTEM_CHANGE,
+    "open_folder_in_app": Tier.SYSTEM_CHANGE,
     "window_focus": Tier.READ,
     "window_state": Tier.READ,
     "window_close": Tier.DESTRUCTIVE,
@@ -117,8 +118,60 @@ def test_open_app_does_not_relax_a_builtin_app_outside_the_index(start_menu):
     assert _spec("open_app").relax({"name": "notepad"}, _ctx()) is False
 
 
-def test_open_app_summary_names_the_app():
-    assert "Telegram" in _spec("open_app").summary({"name": "Telegram"})
+def test_open_app_does_not_relax_a_browser_category(start_menu):
+    _lnk(start_menu, "Google Chrome")
+    assert _spec("open_app").relax({"name": "browser"}, _ctx()) is False
+
+
+def test_open_app_summary_names_the_resolved_program(start_menu):
+    _lnk(start_menu, "Telegram")
+    assert _spec("open_app").summary({"name": "telegram"}) == "Dasturni ochish: Telegram"
+
+
+def test_open_app_summary_never_shows_an_unresolved_name(start_menu):
+    text = _spec("open_app").summary({"name": "zzqxv"})
+    assert "zzqxv" not in text
+
+
+# ----------------------------------------------------- argument check, before the card
+
+def _check(name: str):
+    return _spec("open_app").arg_checks[0]({"name": name}, _ctx(), None)
+
+
+def test_arg_check_lets_an_exact_name_through(start_menu):
+    _lnk(start_menu, "Telegram")
+    assert _check("Telegram") is None
+
+
+def test_arg_check_asks_for_a_choice_and_lists_the_options(start_menu):
+    _lnk(start_menu, "Telegram Desktop")
+    _lnk(start_menu, "Telemost")
+    verdict = _check("tel")
+    assert verdict.decision == Decision.DENY
+    assert verdict.code == "need_choice"
+    assert "Telegram Desktop" in verdict.reason and "Telemost" in verdict.reason
+
+
+def test_arg_check_refuses_an_unknown_name_as_not_found(start_menu):
+    verdict = _check("zzqxv")
+    assert verdict.decision == Decision.DENY and verdict.code == "not_found"
+
+
+def test_arg_check_refuses_a_category_name_as_not_found(start_menu):
+    _lnk(start_menu, "Firefox Browser")
+    verdict = _check("browser")
+    assert verdict.decision == Decision.DENY and verdict.code == "not_found"
+
+
+@pytest.mark.parametrize("name, code", [("cmd", "hard_deny"), ("  ", "arg_invalid")])
+def test_arg_check_passes_the_refusal_code_through(start_menu, name, code):
+    verdict = _check(name)
+    assert verdict.decision == Decision.DENY and verdict.code == code
+
+
+def test_open_app_carries_the_argument_check():
+    assert len(_spec("open_app").arg_checks) == 1
 
 
 # ------------------------------------------------------------------ open_app
@@ -136,7 +189,7 @@ def test_open_app_ambiguous_name_lists_options_and_starts_nothing(start_menu, st
     _lnk(start_menu, "Telemost")
     result = _spec("open_app").handler(_call("open_app", {"name": "tel"}))
     assert result.ok is False
-    assert result.code == "arg_invalid"
+    assert result.code == "need_choice"
     assert sorted(result.data["options"]) == ["Telegram Desktop", "Telemost"]
     assert started == []
 
@@ -158,7 +211,16 @@ def test_open_app_empty_name_is_an_invalid_argument(start_menu, started):
 def test_open_app_unknown_name_says_so(start_menu, started):
     result = _spec("open_app").handler(_call("open_app", {"name": "zzqxv"}))
     assert result.ok is False
+    assert result.code == "not_found"
     assert "topilmadi" in result.error
+    assert started == []
+
+
+def test_open_app_never_starts_a_browser_category(start_menu, started):
+    _lnk(start_menu, "Office Writer")
+    result = _spec("open_app").handler(_call("open_app", {"name": "browser"}))
+    assert result.ok is False and result.code == "not_found"
+    assert started == []
 
 
 @pytest.mark.parametrize("args, fragment", [

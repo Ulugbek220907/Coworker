@@ -24,6 +24,8 @@ EXPECTED = {
     # name: (tier, gov_class, path_args, requires_surfaced, untrusted)
     "find_files": ("READ", "INDEX", ("root",), (), True),
     "list_dir": ("READ", "TOOL", ("path",), (), True),
+    # Added with the project-open work: a folder found by name, untrusted like other names.
+    "find_folder": ("READ", "INDEX", (), (), True),
     "preview_file": ("READ", "TOOL", ("path",), (), True),
     "search_in_files": ("READ", "INDEX", ("paths",), (), True),
     "recent_files": ("READ", "INDEX", (), (), True),
@@ -89,9 +91,9 @@ def _touch(path: Path, text: str = "x") -> Path:
 
 # ----------------------------------------------------------------- surface
 
-def test_there_are_exactly_the_ten_file_rows_of_section_3():
+def test_there_are_exactly_the_file_rows_of_section_3_plus_find_folder():
     assert sorted(SPEC) == sorted(EXPECTED)
-    assert len(files.SPECS) == 10
+    assert len(files.SPECS) == 11
 
 
 @pytest.mark.parametrize("name", sorted(EXPECTED))

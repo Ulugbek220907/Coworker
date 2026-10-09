@@ -143,6 +143,9 @@ class CallContext:
     owner_norm: str = ""             # normalised owner text of this turn
     content_norm: str = ""           # normalised untrusted text seen so far in this turn
     surfaced: frozenset = frozenset()  # normalised paths returned by this turn's searches
+    # The subset of those whose search query came from the owner's own words. Only these are
+    # exempt from the origin check: a search steered by a document is not the owner's choice.
+    surfaced_owner: frozenset = frozenset()
     delivered: frozenset = frozenset() # normalised paths already delivered to the owner
     local_read: bool = False         # this turn already read local data (files, screen, clipboard)
     cancel: Optional[CancelToken] = None

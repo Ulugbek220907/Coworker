@@ -338,15 +338,17 @@ def find_folders(
 
     stop_at = time.monotonic() + deadline
     seen = {_key(h[2]) for h in hits}
+    squashed_query = _squashed(q.text)
     for root in _order_roots(_narrow(roots, allowed_roots), _narrow(priority or [], allowed_roots)):
         for dirpath in _walk_dirs(root, stop_at):
             key = _key(dirpath)
             if key in seen:
                 continue
             seen.add(key)
-            s = textutil.score_expanded(q, os.path.basename(dirpath))
+            name = os.path.basename(dirpath)
+            s = max(textutil.score_expanded(q, name), _squash_score(squashed_query, _squashed(name)))
             if s >= min_score:
-                hits.append((s, os.path.basename(dirpath), dirpath))
+                hits.append((s, name, dirpath))
         if time.monotonic() > stop_at:
             break
 
@@ -357,6 +359,31 @@ def find_folders(
             {"name": n, "path": p, "score": round(s, 2)} for s, n, p in hits[:limit]
         ],
     }
+
+
+def _squashed(text: str) -> str:
+    """A name in comparison form with every space, hyphen and underscore removed.
+
+    Folder names are typed the way people say them, so "mini ai", "mini-ai" and
+    "mini_ai" all have to reach "MiniAI". Removing the separators on both sides
+    makes them equal.
+    """
+    return "".join(ch for ch in textutil.normalize(text) if ch.isalnum())
+
+
+def _squash_score(query: str, name: str) -> float:
+    """Score a squashed folder name against a squashed query: equal is a full hit.
+
+    A query of four or more characters that begins the squashed name is a strong
+    partial hit, the same credit a query word earns for a longer word in textutil.
+    """
+    if not query or not name:
+        return 0.0
+    if name == query:
+        return 1.0
+    if len(query) >= 4 and name.startswith(query):
+        return 0.85
+    return 0.0
 
 
 def _walk_dirs(root: str, stop_at: float):

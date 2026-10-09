@@ -31,3 +31,6 @@ browser-profile/
 Thumbs.db
 .DS_Store
 desktop.ini
+
+# replay transcripts contain the owner's chat and paths
+agent/evals/out/

@@ -38,6 +38,7 @@ TOOL_MODULES = (
     "coworker.tools.office",
     "coworker.tools.desktop",
     "coworker.tools.apps",
+    "coworker.tools.app_lookup",
     "coworker.tools.system",
     "coworker.tools.browser",
     "coworker.tools.web",

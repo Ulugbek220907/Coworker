@@ -15,6 +15,7 @@ from coworker.orchestrator.prompt import CHOICE_NOTE, FORWARD_NOTE
 from coworker.orchestrator.turn import Reply
 from coworker.runtime import LOCAL_WAIT_TEXT, Runtime
 from coworker.safety.pairing import OWNER_CHAT_KEY, OWNER_USER_KEY
+from coworker.store.approval_rows import PENDING
 from fakes.os_fake import FakeOs
 from fakes.telegram_fake import FakeBotApi
 
@@ -116,6 +117,22 @@ def test_a_forwarded_message_is_never_a_command_and_reaches_the_model_as_content
     assert calls == [(OWNER_CHAT, "/panic", Provenance.CONTENT, FORWARD_NOTE)]
 
 
+def test_a_forwarded_no_never_declines_a_waiting_card(store_path):
+    runtime, _ = make_runtime(store_path)
+    calls = record_owner_turns(runtime)
+    card = runtime.store.approval_create(
+        chat_id=OWNER_CHAT, tool="open_app", args={}, summary="card",
+        provenance=int(Provenance.OWNER), autonomy="ask_for_writes", generation=runtime.kill.generation,
+        two_channel=False, ttl_s=300,
+    )
+
+    asyncio.run(runtime._on_message({"chat": {"id": OWNER_CHAT}, "from": {"id": OWNER_USER},
+                                     "text": "yo'q", "forward_date": 1700000000}))
+
+    assert runtime.store.approval_get(card.id).status == PENDING
+    assert calls == [(OWNER_CHAT, "yo'q", Provenance.CONTENT, FORWARD_NOTE)]
+
+
 def test_an_owner_message_is_still_an_owner_turn(store_path):
     runtime, _ = make_runtime(store_path)
     calls = record_owner_turns(runtime)
@@ -123,6 +140,15 @@ def test_an_owner_message_is_still_an_owner_turn(store_path):
     asyncio.run(runtime._on_message({"chat": {"id": OWNER_CHAT}, "text": "hello"}))
 
     assert calls == [(OWNER_CHAT, "hello", Provenance.OWNER, "")]
+
+
+def test_a_typed_yes_with_no_card_waiting_is_an_ordinary_owner_turn(store_path):
+    runtime, _ = make_runtime(store_path)
+    calls = record_owner_turns(runtime)
+
+    asyncio.run(runtime._on_message({"chat": {"id": OWNER_CHAT}, "from": {"id": OWNER_USER}, "text": "ha"}))
+
+    assert calls == [(OWNER_CHAT, "ha", Provenance.OWNER, "")]
 
 
 def test_a_text_answer_removes_the_buttons_of_the_open_question(store_path):

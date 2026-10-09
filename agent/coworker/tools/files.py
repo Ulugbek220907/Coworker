@@ -212,6 +212,17 @@ def _search_in_files(call: ToolCall) -> ToolResult:
     return ToolResult(ok=True, data=result, untrusted=True)
 
 
+def _find_folder(call: ToolCall) -> ToolResult:
+    index = call.svc.index if call.svc is not None else None
+    roots = list(index.roots) if index is not None else _default_roots()
+    result = fs.find_folders(str(call.args.get("query", "")), roots, limit=8)
+    listed = result.get("results") or []
+    if not listed:
+        return ToolResult(ok=True, data={"query": result.get("query", ""), "results": [],
+                                         "message": "Bunday nomli papka topilmadi."})
+    return ToolResult(ok=True, data=result, surfaced=_abs(r["path"] for r in listed))
+
+
 def _recent_files(call: ToolCall) -> ToolResult:
     index = call.svc.index if call.svc is not None else None
     roots = list(index.roots) if index is not None else _default_roots()
@@ -308,6 +319,16 @@ def _check_path_list(args: dict, ctx: CallContext, svc: Optional[Services]) -> O
 # ------------------------------------------------------------------- specs
 
 SPECS: list[ToolSpec] = [
+    ToolSpec(
+        name="find_folder", family="files", tier=Tier.READ,
+        description=(
+            "Find a FOLDER by its name (for example a project folder such as \"mini ai\"). "
+            "Use this before opening a project in an app; the folder returned is the one to use."
+        ),
+        parameters=_schema({"query": {"type": "string", "maxLength": 200}}, ("query",)),
+        handler=_find_folder, gov_class="INDEX", timeout_s=30.0,
+        untrusted=True,
+    ),
     ToolSpec(
         name="find_files",
         family="files",

@@ -38,6 +38,10 @@ TIME_SCHEDULED = 600.0
 HISTORY_TURNS = 14
 MAX_REPLY_CHARS = 1500
 MODEL_MAX_TOKENS = 900
+# The approval card's first line. It is the bot's message, never the model's words.
+CARD_HEADER = "⚠️ Tasdiq kerak:"
+# What an unattended run reports when it ended on a question: the question was sent, no answer yet.
+ASKED_UNATTENDED = "Egasiga savol yuborildi; javobi kutilmoqda."
 
 _AUTONOMY_RANK = {
     Autonomy.ASK_ALWAYS: 3,
@@ -58,6 +62,9 @@ class Reply:
     buttons: list = field(default_factory=list)
     approval_id: Optional[str] = None
     failed: str = ""   # why a turn did not complete, in owner-facing words; empty when it did
+    # Set by a tapped approval that ran: the note that lets the same request go on, and where.
+    follow_up: Optional[str] = None
+    chat_id: Optional[int] = None
 
 
 class Orchestrator:
@@ -123,7 +130,21 @@ class Orchestrator:
                                    chat_id=chat_id, model_text=model_text)
 
     async def run_approved(self, approval_id: str, nonce: str, actor_id: int, owner_id: int | None) -> Reply:
-        """Execute a tapped approval. The frozen action is run, not re-proposed."""
+        """Execute a tapped approval, then let the same request go on from where it stopped.
+
+        A request usually has several steps (open the project, then write into it). The tap
+        runs one of them; the note sent to the model next says what ran and what it gave, so the
+        remaining steps run in the same conversation instead of being dropped.
+        """
+        first = await self._run_tap(approval_id, nonce, actor_id, owner_id)
+        if first.follow_up is None or first.chat_id is None:
+            return first
+        follow = await self.handle_owner(first.chat_id, first.follow_up)
+        text = "\n\n".join(t for t in (first.text, follow.text) if t)
+        return Reply(text, follow.buttons, follow.approval_id, follow.failed)
+
+    async def _run_tap(self, approval_id: str, nonce: str, actor_id: int, owner_id: int | None) -> Reply:
+        """Run the tapped action once, under the owner-turn lock."""
         async with self._owner_turns:
             approval = self.svc.approvals.consume(approval_id, nonce, actor_id, owner_id)
             if approval is None:
@@ -146,9 +167,10 @@ class Orchestrator:
             finally:
                 if kill is not None:
                     kill.unregister(turn.cancel)
-            text = result_text(result)
+            text = result_text(result, approval.summary)
             self.svc.store.turn_add(approval.chat_id, "assistant", text)
-            return Reply(text)
+            follow = _continuation(result, approval.summary) if result.ok else None
+            return Reply(text, follow_up=follow, chat_id=approval.chat_id)
 
     def awaiting_local(self, approval_id: str, nonce: str) -> bool:
         """True when a two-channel approval has the owner's tap but still lacks the laptop's OK.
@@ -184,7 +206,9 @@ class Orchestrator:
         reply = await self._run(turn, MAX_STEPS_SCHEDULED, TIME_SCHEDULED, chat_id=None, model_text=instruction)
         if reply.failed:
             raise JobFailed(reply.failed)
-        return reply.text
+        # An empty result would be reported to the owner as a finished job. A run that ended
+        # on a question has not finished, so it says what did happen.
+        return reply.text or ASKED_UNATTENDED
 
     # --------------------------------------------------------------- the loop
 
@@ -206,9 +230,9 @@ class Orchestrator:
                 kill.unregister(turn.cancel)
 
         if turn.pending is not None:
-            card = f"⚠️ Tasdiq kerak:\n{turn.pending.summary}"
-            if chat_id is not None:
-                self.svc.store.turn_add(chat_id, "assistant", card)
+            # The card is not recorded in the history. Stored as assistant text, a later turn
+            # would read a confirmation that nobody wrote, and could claim the action happened.
+            card = f"{CARD_HEADER}\n{turn.pending.summary}"
             return Reply(card, self.svc.approvals.buttons(turn.pending), str(turn.pending.id))
 
         text = trim(text)
@@ -266,7 +290,9 @@ class Orchestrator:
             if turn.pending is not None:
                 return "", ""
             if turn.end_turn:
-                return (out.text or "").strip(), ""
+                # The ask tool has already sent the question. The model's text beside that call
+                # was written before the tool ran, so it is not reported to the owner as a result.
+                return "", ""
 
         return "Qadamlar tugadi. Savolni qisqaroq qilib qayta yozing.", "qadamlar tugadi"
 
@@ -288,16 +314,37 @@ class Orchestrator:
 
     def _history(self, chat_id: int) -> list[Msg]:
         rows = self.svc.store.turns_recent(chat_id, limit=HISTORY_TURNS)
-        msgs = [Msg(role=r["role"], content=r["content"]) for r in rows if r.get("content")]
+        # Cards that earlier versions stored as assistant text are skipped too, so they stop
+        # being replayed to the model once this version runs.
+        msgs = [Msg(role=r["role"], content=r["content"]) for r in rows
+                if r.get("content") and not _is_card(r)]
         while msgs and msgs[0].role != "user":
             msgs.pop(0)
         return msgs
 
 
-def result_text(result: ToolResult) -> str:
+def _continuation(result: ToolResult, summary: str) -> str:
+    """The note that lets a request go on after one of its steps was approved and ran."""
+    message = result.data.get("message") if isinstance(result.data, dict) else None
+    done = message or summary
+    return (
+        f"[Tasdiqlangan amal bajarildi: {summary}. Natija: {done}] "
+        "Oldingi so'rovda yana qadam qolganmi? Bo'lsa, davom et. Qolmagan bo'lsa, "
+        "bitta qisqa xulosa yoz; natijani faqat yuqoridagi natija bo'yicha ayt."
+    )
+
+
+def result_text(result: ToolResult, summary: str = "") -> str:
+    """What the owner reads after a tapped action: what the tool reported, never a bare "done".
+
+    The tool's own message says what was verified. Without one, the card's summary says
+    what was asked for, so the owner is not told that something happened that nobody checked.
+    """
     if result.ok:
         message = result.data.get("message") if isinstance(result.data, dict) else None
-        return f"✅ {message}" if message else "✅ Bajarildi."
+        if message:
+            return f"✅ {message}"
+        return f"✅ Bajarildi: {summary}" if summary else "✅ Bajarildi."
     return f"❌ {result.error or result.code or 'Bajarilmadi'}"
 
 
@@ -316,3 +363,7 @@ def _asked_text(args: dict) -> str:
     question = str(args.get("question", "")).strip()
     options = [str(o) for o in args.get("options") or []]
     return f"{question}\nVariantlar: {' / '.join(options)}"
+
+
+def _is_card(row: dict) -> bool:
+    return row.get("role") == "assistant" and str(row.get("content", "")).startswith(CARD_HEADER)

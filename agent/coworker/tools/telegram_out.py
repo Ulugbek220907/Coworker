@@ -15,11 +15,14 @@ import logging
 import os
 
 from ..core.types import Decision, Tier, ToolResult
-from ..transport.outbox import MAX_DOCUMENT_BYTES
+from ..transport.outbox import MAX_DOCUMENT_BYTES, MAX_OPTIONS
 from .registry import ToolCall, ToolSpec
 
 log = logging.getLogger("tools.telegram")
 
+# The button that backs the owner out of a choice. It goes last in the options. The prompt
+# names the same text (orchestrator.prompt.CANCEL_OPTION); a test checks that they agree.
+CANCEL_OPTION = "Bekor qilish"
 NOT_CONNECTED = "Telegram ulanmagan."
 SEND_FAILED = "Telegram orqali yuborib bo'lmadi."
 BUDGET_TEXT = {
@@ -85,6 +88,10 @@ def _ask(call: ToolCall) -> ToolResult:
     options = [str(o) for o in call.args.get("options") or []]
     if not options:
         return ToolResult.fail("arg_invalid", "Kamida bitta variant kerak.")
+    # The outbox keeps only the first MAX_OPTIONS, so a longer list would silently lose the
+    # cancel option at its end. Refuse it here, so the model asks again with a shorter list.
+    if len(options) > MAX_OPTIONS:
+        return ToolResult.fail("arg_invalid", f"Ko'pi bilan {MAX_OPTIONS} ta variant.")
     chat_id = _target(call)
     if chat_id is None:
         return ToolResult.fail("not_configured", NOT_CONNECTED)
@@ -150,8 +157,10 @@ SPECS: list[ToolSpec] = [
         family="telegram",
         tier=Tier.OUTBOUND,
         description=(
-            "Ask the owner a question in Telegram with up to six answer buttons. The turn ends "
-            "after this call; the owner's choice arrives later as a button tap."
+            "Ask the owner a question in Telegram with up to six answer buttons, one per option, "
+            "in the order given. Use it for a choice between names a lookup returned, and when the "
+            f"owner may refuse, put \"{CANCEL_OPTION}\" last. The turn ends after this call; the owner's "
+            "choice arrives later as a button tap."
         ),
         parameters={
             "type": "object",
@@ -159,6 +168,7 @@ SPECS: list[ToolSpec] = [
                 "question": {"type": "string", "maxLength": 1000},
                 "options": {
                     "type": "array",
+                    "description": f"answer buttons in order; the last one may be \"{CANCEL_OPTION}\"",
                     "items": {"type": "string", "maxLength": 200},
                     "minItems": 1,
                     "maxItems": 6,
