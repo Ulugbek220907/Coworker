@@ -5,6 +5,16 @@ a person would - list the drives, look inside a folder, ask which one - and
 each walk is bounded by a wall-clock deadline so a 400 GB drive can never hang
 a reply. Directories the model has been useful in before get visited first,
 which is what makes the assistant feel like it is learning the layout.
+
+Three rules apply to every function here:
+
+* ``allowed_roots`` (optional) confines a walk or a listing to the given
+  folders. A root outside them is dropped, and a root that contains one of
+  them is narrowed to that folder. The file index uses this to search only the
+  user folders in its live fallback.
+* Failures come back as ``{"error": ..., "code": ...}``, where ``code`` is one
+  of the section 13 codes in docs/architecture-v2.md.
+* Symbolic links and junctions are never followed.
 """
 from __future__ import annotations
 
@@ -14,9 +24,11 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Optional, Sequence
 
+from . import textutil
 from .extract import SUPPORTED, extract
-from .textutil import score_expanded
+from .textutil import Query
 
 # Noise that is never a user document. Matched case-insensitively against
 # each path component.
@@ -45,6 +57,12 @@ DOC_EXT = SUPPORTED | {
 HIDE_ALWAYS = {".tmp", ".crdownload", ".part", ".lock"}
 HIDE_NAMES = {"desktop.ini", "thumbs.db", ".ds_store"}
 
+# Error codes this layer returns (docs/architecture-v2.md section 13).
+ERR_PATH = "path_invalid"   # missing, unreadable, or outside the allowed folders
+ERR_ARG = "arg_invalid"     # the wrong kind of object: a file where a folder is needed
+
+_FILE_ATTRIBUTE_HIDDEN = 0x2
+
 # Windows knows where these live, including when OneDrive has moved them.
 # Guessing "C:\\Users\\<name>\\Desktop" is wrong on exactly the machines this
 # project targets - the user's own Desktop is under OneDrive.
@@ -71,27 +89,52 @@ FOLDER_ALIASES = {
 }
 
 
-def known_folders() -> dict[str, str]:
-    """{"Desktop": "C:/Users/.../OneDrive/Desktop", ...} - only ones that exist."""
-    if os.name != "nt":
+def _windows_known_folder(guid: str, shell32, ole32) -> Optional[str]:
+    """The path behind one known-folder GUID, or None.
+
+    SHGetKnownFolderPath allocates the path with the COM task allocator, and the
+    caller must release it with CoTaskMemFree. The release runs in ``finally``
+    so a path is not leaked when the call reports a failure after writing it.
+    """
+    import ctypes
+    import uuid
+
+    # Exactly 16 bytes: a GUID. Passing bytes alone would add a NUL terminator.
+    raw = ctypes.create_string_buffer(uuid.UUID(guid).bytes_le, 16)
+    out = ctypes.c_void_p()
+    try:
+        hr = shell32.SHGetKnownFolderPath(ctypes.byref(raw), 0, None, ctypes.pointer(out))
+        if hr != 0 or not out.value:
+            return None
+        return ctypes.wstring_at(out.value)
+    finally:
+        if out.value:
+            ole32.CoTaskMemFree(out)
+
+
+def known_folders(*, shell32=None, ole32=None) -> dict[str, str]:
+    """{"Desktop": "C:/Users/.../OneDrive/Desktop", ...} - only ones that exist.
+
+    ``shell32`` and ``ole32`` replace ``ctypes.windll`` in tests.
+    """
+    if shell32 is None and os.name != "nt":
         home = Path.home()
         return {n: str(home / n) for n in ("Desktop", "Documents", "Downloads")
                 if (home / n).is_dir()}
 
-    import ctypes
-    import uuid
+    if shell32 is None or ole32 is None:
+        import ctypes
+        shell32 = ctypes.windll.shell32
+        ole32 = ctypes.windll.ole32
 
     out: dict[str, str] = {}
     for name, guid in _KNOWN_FOLDER_GUIDS.items():
         try:
-            buf = ctypes.c_wchar_p()
-            raw = ctypes.create_string_buffer(uuid.UUID(guid).bytes_le)
-            if ctypes.windll.shell32.SHGetKnownFolderPath(
-                ctypes.byref(raw), 0, None, ctypes.byref(buf)
-            ) == 0 and buf.value and os.path.isdir(buf.value):
-                out[name] = buf.value
+            path = _windows_known_folder(guid, shell32, ole32)
         except Exception:
             continue
+        if path and os.path.isdir(path):
+            out[name] = path
     return out
 
 DEFAULT_DEADLINE = 8.0
@@ -165,13 +208,15 @@ def _drive_label(root: str) -> str:
 
 # ---------------------------------------------------------------- listing
 
-def list_dir(path: str, limit: int = 60) -> dict:
+def list_dir(path: str, limit: int = 60, *, allowed_roots: Optional[Sequence[str]] = None) -> dict:
     """One directory level: folders first, then documents, newest first."""
     p = Path(path)
+    if not _permitted(str(p), allowed_roots):
+        return _error(ERR_PATH, f"Ruxsat etilmagan papka: {path}")
     if not p.exists():
-        return {"error": f"Topilmadi: {path}"}
+        return _error(ERR_PATH, f"Topilmadi: {path}")
     if not p.is_dir():
-        return {"error": f"Bu papka emas: {path}"}
+        return _error(ERR_ARG, f"Bu papka emas: {path}")
 
     dirs: list[dict] = []
     files: list[Hit] = []
@@ -198,7 +243,7 @@ def list_dir(path: str, limit: int = 60) -> dict:
                 except (OSError, PermissionError):
                     continue
     except PermissionError:
-        return {"error": f"Ruxsat yo'q: {path}"}
+        return _error(ERR_PATH, f"Ruxsat yo'q: {path}")
 
     dirs.sort(key=lambda d: d["name"].lower())
     files.sort(key=lambda f: f.mtime, reverse=True)
@@ -220,34 +265,43 @@ def find_files(
     deadline: float = DEFAULT_DEADLINE,
     min_score: float = 0.35,
     priority: list[str] | None = None,
+    allowed_roots: Optional[Sequence[str]] = None,
 ) -> dict:
     """Score every reachable filename (and its folder path) against ``query``.
 
     ``priority`` folders are walked first so previously useful locations
-    surface before a full-disk sweep burns the time budget.
+    surface before a full-disk sweep burns the time budget. Each file is scored
+    once, even when two roots overlap.
     """
     stop_at = time.monotonic() + deadline
-    ordered = _order_roots(roots, priority)
+    q: Query = textutil.prepare(query)
+    ordered = _order_roots(_narrow(roots, allowed_roots), _narrow(priority or [], allowed_roots))
     hits: list[Hit] = []
+    seen: set[str] = set()
     scanned = 0
     exhausted = True
 
     for root in ordered:
         for dirpath, filename, st in _walk(root, stop_at):
+            full = os.path.join(dirpath, filename)
+            key = _key(full)
+            if key in seen:
+                continue
+            seen.add(key)
             scanned += 1
             # The folder name usually carries as much meaning as the file name.
             haystack = os.path.join(os.path.basename(dirpath), filename)
-            s = score_expanded(query, haystack)
+            s = textutil.score_expanded(q, haystack)
             if s < min_score:
                 continue
-            hits.append(Hit(os.path.join(dirpath, filename), filename, st.st_size, st.st_mtime, s))
+            hits.append(Hit(full, filename, st.st_size, st.st_mtime, s))
         if time.monotonic() > stop_at:
             exhausted = False
             break
 
     hits = _rank(hits)[:limit]
     return {
-        "query": query,
+        "query": q.text,
         "scanned": scanned,
         "complete": exhausted,
         "results": [h.as_dict() for h in hits],
@@ -262,6 +316,7 @@ def find_folders(
     deadline: float = DEFAULT_DEADLINE,
     min_score: float = 0.5,
     priority: list[str] | None = None,
+    allowed_roots: Optional[Sequence[str]] = None,
 ) -> dict:
     """Locate a FOLDER by name.
 
@@ -270,32 +325,34 @@ def find_folders(
     C:\\Users. Well-known folders are answered from Windows itself first,
     which is both instant and correct when OneDrive has redirected them.
     """
-    from .textutil import normalize
-
+    q = textutil.prepare(query)
     hits: list[tuple[float, str, str]] = []
-    wanted = normalize(query)
+    wanted = textutil.normalize(q.text)
 
     for name, path in known_folders().items():
-        candidates = [normalize(name)] + [normalize(a) for a in FOLDER_ALIASES.get(name, ())]
+        if not _permitted(path, allowed_roots):
+            continue
+        candidates = [textutil.normalize(name)] + [textutil.normalize(a) for a in FOLDER_ALIASES.get(name, ())]
         if wanted and any(wanted in c or c in wanted for c in candidates if c):
             hits.append((1.0, name, path))
 
     stop_at = time.monotonic() + deadline
-    seen = {h[2].lower() for h in hits}
-    for root in _order_roots(roots, priority):
+    seen = {_key(h[2]) for h in hits}
+    for root in _order_roots(_narrow(roots, allowed_roots), _narrow(priority or [], allowed_roots)):
         for dirpath in _walk_dirs(root, stop_at):
-            if dirpath.lower() in seen:
+            key = _key(dirpath)
+            if key in seen:
                 continue
-            s = score_expanded(query, os.path.basename(dirpath))
+            seen.add(key)
+            s = textutil.score_expanded(q, os.path.basename(dirpath))
             if s >= min_score:
-                seen.add(dirpath.lower())
                 hits.append((s, os.path.basename(dirpath), dirpath))
         if time.monotonic() > stop_at:
             break
 
     hits.sort(key=lambda h: h[0], reverse=True)
     return {
-        "query": query,
+        "query": q.text,
         "results": [
             {"name": n, "path": p, "score": round(s, 2)} for s, n, p in hits[:limit]
         ],
@@ -318,7 +375,7 @@ def _walk_dirs(root: str, stop_at: float):
                     try:
                         if not entry.is_dir(follow_symlinks=False):
                             continue
-                        if entry.name.startswith(".") or _is_hidden(entry):
+                        if entry.name.startswith(".") or _is_hidden(entry) or is_link_entry(entry):
                             continue
                         if entry.name.lower() in SKIP_DIRS:
                             continue
@@ -337,16 +394,24 @@ def search_in_files(
     *,
     limit: int = 8,
     deadline: float = DEFAULT_DEADLINE,
+    allowed_roots: Optional[Sequence[str]] = None,
 ) -> dict:
-    """Second pass: look *inside* the shortlist for the query words."""
-    from .textutil import expand
+    """Second pass: look *inside* the shortlist for the query words.
 
+    Candidates outside ``allowed_roots`` and repeated candidates are skipped.
+    """
     stop_at = time.monotonic() + deadline
-    terms = expand(query)
+    q = textutil.prepare(query)
+    terms = q.terms
     out: list[dict] = []
+    seen: set[str] = set()
     for path in candidates:
         if time.monotonic() > stop_at or len(out) >= limit:
             break
+        key = _key(path)
+        if key in seen or not _permitted(path, allowed_roots):
+            continue
+        seen.add(key)
         text = extract(path, limit=40_000)
         if not text:
             continue
@@ -359,7 +424,7 @@ def search_in_files(
             "matched": found,
             "snippet": _snippet(text, found[0]),
         })
-    return {"query": query, "results": out}
+    return {"query": q.text, "results": out}
 
 
 def recent_files(
@@ -369,15 +434,22 @@ def recent_files(
     limit: int = 20,
     deadline: float = DEFAULT_DEADLINE,
     priority: list[str] | None = None,
+    allowed_roots: Optional[Sequence[str]] = None,
 ) -> dict:
     """Documents touched recently - answers "the one I was working on"."""
     stop_at = time.monotonic() + deadline
     cutoff = time.time() - days * 86400
     hits: list[Hit] = []
-    for root in _order_roots(roots, priority):
+    seen: set[str] = set()
+    for root in _order_roots(_narrow(roots, allowed_roots), _narrow(priority or [], allowed_roots)):
         for dirpath, filename, st in _walk(root, stop_at):
+            full = os.path.join(dirpath, filename)
+            key = _key(full)
+            if key in seen:
+                continue
+            seen.add(key)
             if st.st_mtime >= cutoff:
-                hits.append(Hit(os.path.join(dirpath, filename), filename, st.st_size, st.st_mtime))
+                hits.append(Hit(full, filename, st.st_size, st.st_mtime))
         if time.monotonic() > stop_at:
             break
     hits.sort(key=lambda h: h.mtime, reverse=True)
@@ -386,8 +458,10 @@ def recent_files(
 
 def preview_file(path: str, chars: int = 1200) -> dict:
     p = Path(path)
+    if not p.exists():
+        return _error(ERR_PATH, f"Fayl topilmadi: {path}")
     if not p.is_file():
-        return {"error": f"Fayl topilmadi: {path}"}
+        return _error(ERR_ARG, f"Bu fayl emas: {path}")
     st = p.stat()
     text = extract(p, limit=max(chars, 2000))
     return {
@@ -400,6 +474,10 @@ def preview_file(path: str, chars: int = 1200) -> dict:
 
 
 # ------------------------------------------------------------------ internals
+
+def _error(code: str, message: str) -> dict:
+    return {"error": message, "code": code}
+
 
 def _walk(root: str, stop_at: float):
     """Depth-limited, deadline-aware walk yielding (dir, name, stat)."""
@@ -416,7 +494,7 @@ def _walk(root: str, stop_at: float):
             with os.scandir(current) as it:
                 for entry in it:
                     try:
-                        if entry.name.startswith(".") or _is_hidden(entry):
+                        if entry.name.startswith(".") or _is_hidden(entry) or is_link_entry(entry):
                             continue
                         if entry.is_dir(follow_symlinks=False):
                             if entry.name.lower() in SKIP_DIRS:
@@ -432,11 +510,56 @@ def _walk(root: str, stop_at: float):
             continue
 
 
+def is_link_entry(entry: os.DirEntry) -> bool:
+    """True for a symbolic link or a junction. Neither is ever followed.
+
+    Cloud placeholders (OneDrive) carry the reparse-point attribute too, but
+    they are not links, so only symlinks and junctions count here.
+    """
+    try:
+        if entry.is_symlink():
+            return True
+        if entry.is_dir(follow_symlinks=False):
+            isjunction = getattr(os.path, "isjunction", None)
+            return bool(isjunction and isjunction(entry.path))
+    except OSError:
+        return True
+    return False
+
+
+def _key(path: str) -> str:
+    """Normalised comparison key for a path."""
+    return os.path.normcase(os.path.normpath(str(path)))
+
+
+def _permitted(path: str, allowed: Optional[Sequence[str]]) -> bool:
+    if allowed is None:
+        return True
+    return any(_within(path, root) for root in allowed)
+
+
+def _narrow(roots: Sequence[str], allowed: Optional[Sequence[str]]) -> list[str]:
+    """Roots confined to the allowlist.
+
+    A root inside an allowed folder is kept. A root that contains allowed
+    folders is replaced by those folders. Anything else is dropped.
+    """
+    if allowed is None:
+        return list(roots)
+    out: list[str] = []
+    for root in roots:
+        if any(_within(root, a) for a in allowed):
+            out.append(root)
+        else:
+            out.extend(a for a in allowed if _within(a, root))
+    return out
+
+
 def _order_roots(roots: list[str], priority: list[str] | None) -> list[str]:
     """Known-good folders first, then the rest, without duplicates."""
     ordered: list[str] = []
     for p in priority or []:
-        if os.path.isdir(p) and p not in ordered:
+        if os.path.isdir(p) and not any(_key(p) == _key(o) for o in ordered):
             ordered.append(p)
     for r in roots:
         if os.path.isdir(r) and not any(_within(r, o) for o in ordered):
@@ -466,26 +589,18 @@ def _rank(hits: list[Hit]) -> list[Hit]:
 
 
 def _norm_words(text: str) -> list[str]:
-    from .textutil import tokens
-    return tokens(text[:40_000], do_stem=True)
+    return textutil.tokens(text[:40_000], do_stem=True)
 
 
 def _snippet(text: str, term: str, width: int = 160) -> str:
-    from .textutil import translit
-
-    flat = translit(text)
-    idx = flat.find(term)
-    if idx < 0:
-        return text[:width].replace("\n", " ")
-    start = max(0, idx - width // 3)
-    return ("..." if start else "") + text[start : start + width].replace("\n", " ") + "..."
+    return textutil.snippet(text, term, width)
 
 
 def _is_hidden(entry: os.DirEntry) -> bool:
     if os.name != "nt":
         return False
     try:
-        return bool(entry.stat(follow_symlinks=False).st_file_attributes & 0x2)
+        return bool(entry.stat(follow_symlinks=False).st_file_attributes & _FILE_ATTRIBUTE_HIDDEN)
     except (OSError, AttributeError):
         return False
 

@@ -22,6 +22,21 @@ code below:
   COM is thread-affine. Every call is marshalled onto one dedicated worker
   thread with its own apartment, so control objects are never touched from the
   thread that made them.
+
+Three rules the tool layer depends on:
+
+  Names match exactly. A window or control is chosen by its full cleaned name,
+  case and apostrophes folded, never by a substring: "Notes" must not reach
+  "Notes Pro". When several windows share a name the call refuses and returns
+  the candidates with their handles, so the model can pick one by handle.
+
+  An action that outlives its timeout is abandoned. Its result is dropped and
+  the outcome is reported as unknown. A UI that stops answering usually keeps
+  not answering, so after three abandoned jobs the worker is switched off until
+  the process restarts.
+
+  Blocked windows are never read. A password manager's tree is refused by title
+  or class, the same list the screenshot path uses.
 """
 from __future__ import annotations
 
@@ -32,7 +47,9 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
+
+from .core.types import normalize_text
 
 log = logging.getLogger("uia")
 
@@ -40,6 +57,7 @@ WALK_DEADLINE = 10.0
 MAX_DEPTH = 12
 MAX_ELEMENTS = 70          # what a model can usefully hold at once
 CALL_TIMEOUT = 25.0
+MAX_ABANDONED = 3          # section 7: three abandoned jobs disable the pool
 
 # Controls worth offering as something to act on.
 INTERACTIVE = {
@@ -50,9 +68,10 @@ INTERACTIVE = {
 # Controls worth reading for content, but not clicking.
 READABLE = {"Text", "StatusBar", "ToolTip", "Header"}
 
-# Icon fonts (Segoe MDL2 and friends) put glyphs in the private use area and
-# UIA reports them as the control's name. They are pure noise to a model.
-_PUA = re.compile(r"[-\U000f0000-\U000ffffd]")
+# Icon fonts (Segoe MDL2 and friends) put glyphs in the private use areas and
+# UIA reports them as the control's name. Only those glyphs are removed: a
+# hyphen is part of a real name ("Save-As") and must stay.
+_PUA = re.compile(r"[-\U000f0000-\U000ffffd\U00100000-\U0010fffd]")
 _WS = re.compile(r"\s+")
 
 # Internal names that carry no meaning for a person or a model.
@@ -61,19 +80,14 @@ _JUNK_NAMES = {
     "accessibletext", "layoutroot", "popup", "overflowbutton",
 }
 
-# An action whose label matches one of these is treated as irreversible and
-# is confirmed even though ordinary clicking is not. Three languages, because
-# the machine this runs on is localised in all of them.
-DANGEROUS = re.compile(
-    r"\b("
-    r"delete|remove|erase|format|uninstall|reset|wipe|discard|"
-    r"send|submit|post|publish|pay|purchase|buy|order|transfer|confirm|"
-    r"shut\s*down|restart|sign\s*out|log\s*out|"
-    r"удал|очист|формат|удалить|сброс|отправ|оплат|купит|перевод|подтверд|"
-    r"выключ|перезагруз|выйти|"
-    r"ochir|yubor|tola|sotib|tasdiq|chiqish"
-    r")", re.IGNORECASE,
+# Windows whose contents are never read or captured, matched by title or class.
+# Password managers and the Windows credential and security prompts. The owner
+# may add more under "blocked_windows" in the config.
+DEFAULT_BLOCKED_WINDOWS: tuple[str, ...] = (
+    "keepass", "bitwarden", "1password", "lastpass", "dashlane", "keeper", "enpass",
+    "password", "parol", "credential", "windows security", "windows hello",
 )
+BLOCKED_TEXT = "Bu oyna maxfiy deb belgilangan — o'qilmaydi va skrinshoti olinmaydi."
 
 
 # --------------------------------------------------------------- availability
@@ -124,6 +138,28 @@ def status() -> str:
 
 # ------------------------------------------------------------- worker thread
 
+class JobAbandoned(TimeoutError):
+    """A UIA job outlived its timeout. Its result is dropped and the outcome is unknown."""
+
+
+class PoolDisabled(RuntimeError):
+    """Too many jobs were abandoned. The UIA pool stays off until the process restarts."""
+
+
+def _init_com() -> None:
+    """Start COM on the UIA thread. Off Windows there is no COM, so nothing to do."""
+    if os.name != "nt":
+        return
+    import comtypes
+    try:
+        comtypes.CoInitializeEx(comtypes.COINIT_APARTMENTTHREADED)
+    except Exception:
+        try:
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+
+
 class _Worker:
     """Runs every UIA call on one thread, because COM is apartment-bound.
 
@@ -136,6 +172,7 @@ class _Worker:
         self._jobs: queue.Queue = queue.Queue()
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
+        self._abandoned = 0
 
     def _ensure(self) -> None:
         with self._lock:
@@ -145,14 +182,7 @@ class _Worker:
             self._thread.start()
 
     def _loop(self) -> None:
-        import comtypes
-        try:
-            comtypes.CoInitializeEx(comtypes.COINIT_APARTMENTTHREADED)
-        except Exception:
-            try:
-                comtypes.CoInitialize()
-            except Exception:
-                pass
+        _init_com()
         while True:
             fn, box = self._jobs.get()
             try:
@@ -163,17 +193,44 @@ class _Worker:
                 box["done"].set()
 
     def call(self, fn: Callable[[], Any], timeout: float = CALL_TIMEOUT) -> Any:
+        with self._lock:
+            if self._abandoned >= MAX_ABANDONED:
+                raise PoolDisabled(
+                    "UIA xizmati o'chirilgan: ketma-ket uchta amal osilib qoldi. "
+                    "Ilovani qayta ishga tushiring."
+                )
         self._ensure()
         box: dict[str, Any] = {"done": threading.Event()}
         self._jobs.put((fn, box))
         if not box["done"].wait(timeout):
-            raise TimeoutError("UIA javob bermadi")
+            # The job keeps running on the worker, but nobody waits for it any
+            # more: its result is dropped and the caller learns the outcome is unknown.
+            with self._lock:
+                self._abandoned += 1
+                count = self._abandoned
+            log.warning("UIA job abandoned after %.0fs (%d of %d)", timeout, count, MAX_ABANDONED)
+            raise JobAbandoned("UIA javob bermadi")
         if "error" in box:
             raise box["error"]
         return box.get("result")
 
 
 _worker = _Worker()
+
+
+def run(fn: Callable[[], Any], timeout: float = CALL_TIMEOUT) -> Any:
+    """Run `fn` on the UIA thread. Failures come back as {"error", "code"} dicts."""
+    try:
+        return _worker.call(fn, timeout=timeout)
+    except JobAbandoned:
+        return {
+            "error": "Amal javob bermadi — natija noma'lum. Oynani qayta o'qing.",
+            "code": "timeout", "outcome": "unknown",
+        }
+    except PoolDisabled as exc:
+        return {"error": str(exc), "code": "throttled"}
+    except Exception as exc:
+        return {"error": f"Xato: {str(exc)[:150]}"}
 
 
 # ------------------------------------------------------------------ snapshot
@@ -187,10 +244,13 @@ class Element:
     value: str = ""
     state: str = ""
     rect: tuple[int, int, int, int] = (0, 0, 0, 0)
+    is_password: bool = False       # the value of a password field is never read
 
     def line(self) -> str:
         out = f"[{self.ref}] {self.type} \"{self.name}\""
-        if self.value:
+        if self.is_password:
+            out += " (parol: qiymati ko'rsatilmaydi)"
+        elif self.value:
             out += f" = \"{self.value[:40]}\""
         if self.state:
             out += f" ({self.state})"
@@ -222,10 +282,54 @@ class Snapshot:
 _snapshots: dict[int, Snapshot] = {}
 
 
+def snapshot(handle: int) -> Snapshot | None:
+    """The most recent read of a window. Refs in actions refer to this snapshot."""
+    return _snapshots.get(handle)
+
+
+# ------------------------------------------------------------ pure selection
+
+def is_blocked_window(title: str, class_name: str, patterns: Iterable[str]) -> bool:
+    """True when the title or the class of a window contains a blocked pattern.
+
+    Substring and case-folded on purpose: a password manager shows its name in
+    many forms ("KeePass", "KeePassXC - Database") and a near miss is a leak.
+    """
+    fields = (normalize_text(title), normalize_text(class_name))
+    for pattern in patterns:
+        needle = normalize_text(str(pattern))
+        if needle and any(needle in f for f in fields):
+            return True
+    return False
+
+
+def pick_window(names: list[str], wanted: str) -> tuple[int | None, list[int]]:
+    """The index of the one window named `wanted`, or the indexes of the tie.
+
+    Returns (index, []) for a unique exact match, (None, indexes) when several
+    windows carry that name, and (None, []) when none does.
+    """
+    key = normalize_text(wanted)
+    if not key:
+        return None, []
+    hits = [i for i, name in enumerate(names) if normalize_text(name) == key]
+    if len(hits) == 1:
+        return hits[0], []
+    return None, hits
+
+
+def similar_titles(names: list[str], wanted: str, limit: int = 8) -> list[str]:
+    """Titles that merely contain `wanted`. Shown as hints, never acted on."""
+    key = normalize_text(wanted)
+    if not key:
+        return []
+    return [name for name in names if key in normalize_text(name)][:limit]
+
+
 # ------------------------------------------------------------------- reading
 
 def list_windows() -> dict:
-    """Visible top-level windows, newest interaction first."""
+    """Visible top-level windows with their handles."""
     if not available():
         return {"error": status()}
 
@@ -233,9 +337,8 @@ def list_windows() -> dict:
         import uiautomation as auto
 
         auto.SetGlobalSearchTimeout(2)
-        root = auto.GetRootControl()
         found = []
-        for w in root.GetChildren():
+        for w in auto.GetRootControl().GetChildren():
             try:
                 if w.ControlTypeName != "WindowControl":
                     continue
@@ -246,7 +349,7 @@ def list_windows() -> dict:
                 if r.width() <= 0 or r.height() <= 0:
                     continue
                 found.append({
-                    "title": name[:70],
+                    "title": name,
                     "class": w.ClassName,
                     "pid": w.ProcessId,
                     "handle": w.NativeWindowHandle,
@@ -255,15 +358,18 @@ def list_windows() -> dict:
                 continue
         return found
 
-    try:
-        windows = _worker.call(job, timeout=20)
-    except Exception as exc:
-        return {"error": f"Oynalarni o'qib bo'lmadi: {exc}"}
+    windows = run(job, timeout=20)
+    if isinstance(windows, dict):
+        return windows
     return {"windows": windows, "count": len(windows)}
 
 
-def read_window(title: str = "", handle: int = 0, limit: int = MAX_ELEMENTS) -> dict:
-    """Serialise one window into a numbered, actionable element list."""
+def find_window(title: str) -> dict:
+    """The handle and exact title of the one window called `title`.
+
+    Returns {"handle", "title"}, or an error. A tie comes back with the
+    candidate windows so the caller can choose one by handle.
+    """
     if not available():
         return {"error": status()}
 
@@ -271,19 +377,84 @@ def read_window(title: str = "", handle: int = 0, limit: int = MAX_ELEMENTS) -> 
         import uiautomation as auto
 
         auto.SetGlobalSearchTimeout(1)
-        win = _locate(auto, title, handle)
-        if win is None:
-            return {"error": f"Oyna topilmadi: {title or handle}"}
+        control, err = _select(auto, title, 0)
+        if err:
+            return err
+        handle = _handle_of(control)
+        if not handle:
+            # Handle 0 would mean "the whole screen" to a screenshot, so it is never returned.
+            return {"error": "Oynaning handle'i aniqlanmadi.", "code": "element_gone"}
+        return {"handle": handle, "title": _clean(control.Name), "pid": _pid_of(control)}
+
+    return run(job, timeout=8)
+
+
+def _pid_of(control) -> int:
+    try:
+        return int(control.ProcessId)
+    except Exception:
+        return 0
+
+
+def process_image(pid: int) -> str:
+    """The lower-cased file name of a process's program (for example "mintty.exe"), or "".
+
+    The window title is chosen by the program it shows, so the program is the
+    stronger signal for "this window runs commands". Returns "" when the process
+    cannot be read; callers treat that as unknown, never as harmless.
+    """
+    if os.name != "nt" or not pid:
+        return ""
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD),
+    ]
+    kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(1024)
+        buffer = ctypes.create_unicode_buffer(1024)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return os.path.basename(buffer.value).lower()
+    except Exception:
+        return ""
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def read_window(
+    title: str = "",
+    handle: int = 0,
+    limit: int = MAX_ELEMENTS,
+    blocked: Iterable[str] = DEFAULT_BLOCKED_WINDOWS,
+) -> dict:
+    """Serialise one window into a numbered, actionable element list."""
+    if not available():
+        return {"error": status()}
+    patterns = tuple(blocked)
+
+    def job():
+        import uiautomation as auto
+
+        auto.SetGlobalSearchTimeout(1)
+        win, err = _select(auto, title, handle)
+        if err:
+            return err
+        if is_blocked_window(_clean(win.Name), _class_of(win), patterns):
+            return {"error": BLOCKED_TEXT, "code": "blocked_window"}
         return _walk(win, limit)
 
-    try:
-        result = _worker.call(job, timeout=CALL_TIMEOUT)
-    except TimeoutError:
-        return {"error": "Oyna javob bermadi (Electron ilova bo'lishi mumkin)."}
-    except Exception as exc:
-        return {"error": f"O'qishda xato: {exc}"}
-
-    if isinstance(result, dict) and result.get("error"):
+    result = run(job)
+    if isinstance(result, dict):
         return result
 
     snap: Snapshot = result
@@ -299,22 +470,27 @@ def read_window(title: str = "", handle: int = 0, limit: int = MAX_ELEMENTS) -> 
     }
 
 
-def _locate(auto, title: str, handle: int):
-    root = auto.GetRootControl()
-    children = root.GetChildren()
+def _select(auto, title: str, handle: int) -> tuple[Any, dict | None]:
+    """Choose one top-level window. Runs on the UIA thread.
+
+    Returns (control, None), or (None, error) with the error dict to hand back.
+    A handle wins over a title. A title must match one window exactly.
+    """
+    children = auto.GetRootControl().GetChildren()
     if handle:
         for w in children:
             try:
                 if w.NativeWindowHandle == handle:
-                    return w
+                    return w, None
             except Exception:
                 continue
-        return None
+        return None, {"error": "Oyna topilmadi (yopilgan bo'lishi mumkin).", "code": "element_gone"}
 
-    from .textutil import normalize
-
-    wanted = normalize(title)
-    best = None
+    wanted = _clean(title)
+    if not wanted:
+        return None, {"error": "Oyna nomi yoki handle kerak.", "code": "arg_invalid"}
+    controls: list[Any] = []
+    names: list[str] = []
     for w in children:
         try:
             if w.ControlTypeName != "WindowControl":
@@ -322,18 +498,43 @@ def _locate(auto, title: str, handle: int):
             name = _clean(w.Name)
             if not name:
                 continue
-            if name.lower() == title.lower():
-                return w
-            if wanted and wanted in normalize(name) and best is None:
-                best = w
+            controls.append(w)
+            names.append(name)
         except Exception:
             continue
-    return best
+
+    index, tied = pick_window(names, wanted)
+    if index is not None:
+        return controls[index], None
+    if tied:
+        return None, {
+            "error": f"«{wanted}» nomli bir nechta oyna bor. handle bilan aniqlang.",
+            "code": "ambiguous_window",
+            "candidates": [{"title": names[i], "handle": _handle_of(controls[i])} for i in tied],
+        }
+    return None, {
+        "error": f"Oyna topilmadi: «{wanted}». Ro'yxatdagi aniq nomini yoki handle'ini ishlating.",
+        "similar": similar_titles(names, wanted),
+    }
+
+
+def _handle_of(control) -> int:
+    try:
+        return int(control.NativeWindowHandle)
+    except Exception:
+        return 0
+
+
+def _class_of(control) -> str:
+    try:
+        return str(control.ClassName or "")
+    except Exception:
+        return ""
 
 
 def _walk(win, limit: int) -> Snapshot:
     started = time.monotonic()
-    snap = Snapshot(title=_clean(win.Name)[:70])
+    snap = Snapshot(title=_clean(win.Name))
     try:
         snap.handle = win.NativeWindowHandle
     except Exception:
@@ -384,10 +585,13 @@ def _walk(win, limit: int) -> Snapshot:
                 continue
 
             ref += 1
+            password = _is_password(child, kind)
             snap.elements.append(Element(
                 ref=ref, type=kind, name=name[:60], path=child_path,
-                value=_value_of(child, kind), state=_state_of(child),
+                value="" if password else _value_of(child, kind),
+                state=_state_of(child),
                 rect=(rect.left, rect.top, rect.right, rect.bottom),
+                is_password=password,
             ))
 
     snap.seconds = time.monotonic() - started
@@ -428,9 +632,13 @@ def _web_alternative(title: str) -> str:
     return ""
 
 
-def web_alternative(app_name: str) -> str:
-    """Public: the web URL for an app the browser can drive instead."""
-    return _web_alternative(app_name)
+def _is_password(control, kind: str) -> bool:
+    if kind != "Edit":
+        return False
+    try:
+        return bool(control.IsPassword)
+    except Exception:
+        return False
 
 
 def _value_of(control, kind: str) -> str:
@@ -473,52 +681,75 @@ def _clean(name: Any) -> str:
 
 # ------------------------------------------------------------------- acting
 
-def is_dangerous(label: str) -> bool:
-    return bool(DANGEROUS.search(label or ""))
-
-
-def click(handle: int, ref: int) -> dict:
-    """Activate an element through its UIA pattern, falling back to a click.
+def click(
+    handle: int,
+    ref: int,
+    blocked: Iterable[str] = DEFAULT_BLOCKED_WINDOWS,
+    expect_name: str | None = None,
+) -> dict:
+    """Activate an element through its UIA pattern, falling back to a checked pointer click.
 
     The pattern route is preferred because it works on a background window and
     does not move the user's mouse or steal their focus - exactly the problem
     Microsoft's UFO research solved with a picture-in-picture desktop.
+
+    ``expect_name`` is the label the owner was shown on the confirmation card. A
+    ref is only a position in the newest snapshot, so the click is refused when
+    that position now holds a control with another label; the card's risk
+    classification applies to the label, and a different label would escape it.
     """
-    return _act(handle, ref, _do_click)
+    element, err = _cached(handle, ref)
+    if err:
+        return err
+    if expect_name is not None and normalize_text(element.name) != normalize_text(expect_name):
+        return {
+            "error": f"[{ref}] endi «{element.name}» — tasdiqlangan «{expect_name}» emas. Oynani qayta o'qing.",
+            "code": "element_gone",
+        }
+    return _act(handle, element, lambda c, e: _do_click(c, e, handle), tuple(blocked))
 
 
-def set_text(handle: int, ref: int, text: str) -> dict:
-    return _act(handle, ref, lambda c, e: _do_type(c, e, text))
+def set_text(handle: int, ref: int, text: str, blocked: Iterable[str] = DEFAULT_BLOCKED_WINDOWS) -> dict:
+    """Put text into an editable element. Password fields are refused."""
+    element, err = _cached(handle, ref)
+    if err:
+        return err
+    if element.is_password:
+        return {"error": "Parol maydoniga matn yozib bo'lmaydi.", "code": "password_field"}
+    return _act(handle, element, lambda c, e: _do_type(c, e, text, handle), tuple(blocked))
 
 
-def _act(handle: int, ref: int, action) -> dict:
+def _cached(handle: int, ref: int) -> tuple[Element | None, dict | None]:
     if not available():
-        return {"error": status()}
+        return None, {"error": status()}
     snap = _snapshots.get(handle)
     if snap is None:
-        return {"error": "Avval read_window bilan oynani o'qing."}
+        return None, {"error": "Avval read_window bilan oynani o'qing.", "code": "element_gone"}
     element = snap.by_ref(ref)
     if element is None:
-        return {"error": f"[{ref}] elementi bu oynada yo'q."}
+        return None, {"error": f"[{ref}] elementi bu oynada yo'q.", "code": "element_gone"}
+    return element, None
 
+
+def _act(handle: int, element: Element, action, blocked: tuple[str, ...]) -> dict:
     def job():
         import uiautomation as auto
 
         auto.SetGlobalSearchTimeout(1)
-        win = _locate(auto, "", handle)
-        if win is None:
-            return {"error": "Oyna yopilgan."}
+        win, err = _select(auto, "", handle)
+        if err:
+            return err
+        if is_blocked_window(_clean(win.Name), _class_of(win), blocked):
+            return {"error": BLOCKED_TEXT, "code": "blocked_window"}
         control = _resolve(win, element)
         if control is None:
-            return {"error": f"«{element.name}» endi topilmadi — oyna o'zgargan. Qayta o'qing."}
+            return {
+                "error": f"«{element.name}» endi topilmadi — oyna o'zgargan. Qayta o'qing.",
+                "code": "element_gone",
+            }
         return action(control, element)
 
-    try:
-        return _worker.call(job, timeout=CALL_TIMEOUT)
-    except TimeoutError:
-        return {"error": "Amal javob bermadi."}
-    except Exception as exc:
-        return {"error": f"Xato: {exc}"}
+    return run(job)
 
 
 def set_window_state(handle: int, state: int) -> dict:
@@ -534,16 +765,16 @@ def set_window_state(handle: int, state: int) -> dict:
         import uiautomation as auto
 
         auto.SetGlobalSearchTimeout(1)
-        win = _locate(auto, "", handle)
-        if win is None:
-            return {"error": "Oyna topilmadi."}
+        win, err = _select(auto, "", handle)
+        if err:
+            return err
         try:
             win.GetWindowPattern().SetWindowVisualState(state)
             return {"ok": True, "window": _clean(win.Name)[:60], "state": state}
         except Exception as exc:
             return {"error": f"Oyna holatini o'zgartirib bo'lmadi: {exc}"}
 
-    return _window_call(job)
+    return run(job)
 
 
 def foreground_handle() -> int:
@@ -556,6 +787,85 @@ def foreground_handle() -> int:
         return int(ctypes.windll.user32.GetForegroundWindow())
     except Exception:
         return 0
+
+
+def ensure_foreground(handle: int, blocked: Iterable[str] = DEFAULT_BLOCKED_WINDOWS) -> dict | None:
+    """Make `handle` the foreground window. Returns None once it is, or an error with sent=False.
+
+    A blocked window is refused even when it already has the focus: keys typed
+    into a password manager are as much a leak as keys read out of one.
+
+    Call this only inside a UIA job (it runs on the worker thread). A caller
+    that sends keys calls it in the same job as the keystrokes, so no other job
+    can take the focus between the check and the send.
+    """
+    if not handle:
+        return {"error": "Oyna tanlanmagan (handle 0).", "code": "arg_invalid", "sent": False}
+    import uiautomation as auto
+
+    auto.SetGlobalSearchTimeout(1)
+    win, err = _select(auto, "", handle)
+    if err:
+        return {**err, "sent": False}
+    if is_blocked_window(_clean(win.Name), _class_of(win), tuple(blocked)):
+        return {"error": BLOCKED_TEXT, "code": "blocked_window", "sent": False}
+    if foreground_handle() == handle:
+        return None
+    result = _bring_forward(win, handle)
+    if result.get("ok"):
+        return None
+    return {**result, "sent": False}
+
+
+def ensure_not_password_focus(auto: Any) -> dict | None:
+    """Refuse when the control that would receive keystrokes is a password field.
+
+    A window can be the foreground one and still have a password box focused (a
+    login page in a browser), so the window check alone does not stop text from
+    landing in a secret. When the focused control cannot be read at all, nothing is
+    sent either: the owner cannot be sure where the keys would go.
+
+    Call this inside the same UIA job as the keystrokes, after ensure_foreground.
+    """
+    try:
+        focused = auto.GetFocusedControl()
+    except Exception:
+        return {"error": "Fokusdagi maydonni aniqlab bo'lmadi — tugmalar yuborilmadi.",
+                "code": "focus_unknown", "sent": False}
+    try:
+        is_password = bool(getattr(focused, "IsPassword", False)) if focused is not None else False
+    except Exception:
+        return {"error": "Fokusdagi maydonni aniqlab bo'lmadi — tugmalar yuborilmadi.",
+                "code": "focus_unknown", "sent": False}
+    if is_password:
+        return {"error": "Fokus parol maydonida — matn yuborilmadi.", "code": "password_field", "sent": False}
+    return None
+
+
+def _bring_forward(win, handle: int) -> dict:
+    """Bring a window to the front and confirm it came forward. Runs on the UIA thread."""
+    name = _clean(win.Name)[:60]
+    try:
+        if win.GetWindowPattern().WindowVisualState == 2:
+            win.GetWindowPattern().SetWindowVisualState(0)
+    except Exception:
+        pass
+    try:
+        win.SetFocus()
+    except Exception:
+        pass
+
+    if _force_foreground(handle):
+        return {"ok": True, "window": name, "foreground": True}
+    return {
+        "ok": False,
+        "window": name,
+        "foreground": False,
+        "error": (
+            f"«{name}» oynasini oldinga chiqarib bo'lmadi. Windows ba'zan "
+            "buni to'sadi (to'liq ekrandagi ilova yoki administrator oynasi)."
+        ),
+    }
 
 
 def _force_foreground(handle: int) -> bool:
@@ -598,37 +908,11 @@ def _force_foreground(handle: int) -> bool:
         log.info("foreground failed: %s", exc)
         return False
 
-    import time
-
     for _ in range(10):                 # give the switch a moment to settle
         if foreground_handle() == handle:
             return True
         time.sleep(0.05)
     return foreground_handle() == handle
-
-
-def click_at(x: int, y: int) -> dict:
-    """Real mouse click at screen coordinates.
-
-    Electron/Chromium editors (Antigravity, VS Code, Cursor) do not accept
-    keyboard input reliably until a real click gives their internal editor the
-    caret - window focus alone is not enough. Clicking a large target like a
-    chat input box does not need pixel precision, so a coarse vision-located
-    point is enough; a terminal is happy with a click anywhere too.
-    """
-    if not available():
-        return {"error": status()}
-
-    def job():
-        import uiautomation as auto
-
-        try:
-            auto.Click(int(x), int(y), waitTime=0.1)
-            return {"ok": True, "at": [int(x), int(y)]}
-        except Exception as exc:
-            return {"error": f"Bosib bo'lmadi: {exc}"}
-
-    return _window_call(job)
 
 
 def focus_window(handle: int) -> dict:
@@ -640,37 +924,20 @@ def focus_window(handle: int) -> dict:
         import uiautomation as auto
 
         auto.SetGlobalSearchTimeout(1)
-        win = _locate(auto, "", handle)
-        if win is None:
-            return {"error": "Oyna topilmadi."}
-        name = _clean(win.Name)[:60]
-        try:
-            if win.GetWindowPattern().WindowVisualState == 2:
-                win.GetWindowPattern().SetWindowVisualState(0)
-        except Exception:
-            pass
-        try:
-            win.SetFocus()
-        except Exception:
-            pass
+        win, err = _select(auto, "", handle)
+        if err:
+            return err
+        return _bring_forward(win, handle)
 
-        if _force_foreground(handle):
-            return {"ok": True, "window": name, "foreground": True}
-        return {
-            "ok": False,
-            "window": name,
-            "foreground": False,
-            "error": (
-                f"«{name}» oynasini oldinga chiqarib bo'lmadi. Windows ba'zan "
-                "buni to'sadi (to'liq ekrandagi ilova yoki administrator oynasi)."
-            ),
-        }
-
-    return _window_call(job)
+    return run(job)
 
 
 def close_window(handle: int) -> dict:
-    """Close a window. Irreversible - the caller must confirm first."""
+    """Ask a window to close. Irreversible once it happens - the caller must confirm first.
+
+    A window may refuse: an unsaved-changes prompt is a normal answer. So the
+    result is close_requested, never closed, and it is never reported as done.
+    """
     if not available():
         return {"error": status()}
 
@@ -678,27 +945,27 @@ def close_window(handle: int) -> dict:
         import uiautomation as auto
 
         auto.SetGlobalSearchTimeout(1)
-        win = _locate(auto, "", handle)
-        if win is None:
-            return {"error": "Oyna topilmadi (yopilgan bo'lishi mumkin)."}
+        win, err = _select(auto, "", handle)
+        if err:
+            return err
         name = _clean(win.Name)[:60]
         try:
             win.GetWindowPattern().Close()
-            return {"ok": True, "closed": name}
+            return {"ok": True, "close_requested": name}
         except Exception as exc:
-            return {"error": f"Oynani yopib bo'lmadi: {exc}"}
+            return {"error": f"Oynani yopish so'rovini yuborib bo'lmadi: {exc}"}
 
-    return _window_call(job)
+    return run(job)
 
 
 def window_by_handle(handle: int) -> dict | None:
-    """Look up a window's title/state for the confirmation prompt."""
+    """Look up a window's title and state for a confirmation prompt."""
     def job():
         import uiautomation as auto
 
         auto.SetGlobalSearchTimeout(1)
-        win = _locate(auto, "", handle)
-        if win is None:
+        win, err = _select(auto, "", handle)
+        if err:
             return None
         try:
             return {"title": _clean(win.Name)[:70],
@@ -706,19 +973,8 @@ def window_by_handle(handle: int) -> dict | None:
         except Exception:
             return {"title": _clean(win.Name)[:70], "state": 0}
 
-    try:
-        return _worker.call(job, timeout=15)
-    except Exception:
-        return None
-
-
-def _window_call(job) -> dict:
-    try:
-        return _worker.call(job, timeout=CALL_TIMEOUT)
-    except TimeoutError:
-        return {"error": "Oyna javob bermadi."}
-    except Exception as exc:
-        return {"error": f"Xato: {exc}"}
+    info = run(job, timeout=15)
+    return info if isinstance(info, dict) and "title" in info else None
 
 
 def _resolve(win, element: Element):
@@ -764,7 +1020,7 @@ def _resolve(win, element: Element):
     return None
 
 
-def _do_click(control, element: Element) -> dict:
+def _do_click(control, element: Element, handle: int) -> dict:
     for attempt in (
         lambda: control.GetInvokePattern().Invoke(),
         lambda: control.GetTogglePattern().Toggle(),
@@ -776,7 +1032,22 @@ def _do_click(control, element: Element) -> dict:
             return {"ok": True, "clicked": element.name, "via": "UIA pattern"}
         except Exception:
             continue
-    # Last resort: a real mouse click, which does take over the pointer.
+
+    # Last resort: a real pointer click. The pointer goes wherever it is, so the
+    # click is made only when the target window is in front and the control's
+    # centre really belongs to it - otherwise another window would take it.
+    import uiautomation as auto
+
+    err = ensure_foreground(handle)
+    if err:
+        return err
+    rect = control.BoundingRectangle
+    hit = auto.ControlFromPoint((rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2)
+    if hit is None or _handle_of(hit.GetTopLevelControl()) != handle:
+        return {
+            "error": f"«{element.name}» boshqa oyna ostida qolgan — sichqoncha bilan bosilmadi.",
+            "code": "element_gone",
+        }
     try:
         control.Click(simulateMove=False)
         return {"ok": True, "clicked": element.name, "via": "sichqoncha"}
@@ -784,12 +1055,17 @@ def _do_click(control, element: Element) -> dict:
         return {"error": f"Bosib bo'lmadi: {exc}"}
 
 
-def _do_type(control, element: Element, text: str) -> dict:
+def _do_type(control, element: Element, text: str, handle: int) -> dict:
     try:
         control.GetValuePattern().SetValue(text)
         return {"ok": True, "typed_into": element.name, "via": "UIA pattern"}
     except Exception:
         pass
+    # Keystrokes reach the focused window only, so they are sent after the target
+    # has been focused and verified in this same job.
+    err = ensure_foreground(handle)
+    if err:
+        return err
     try:
         control.SetFocus()
         control.SendKeys("{Ctrl}a", waitTime=0.05)

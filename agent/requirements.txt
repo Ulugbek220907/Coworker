@@ -21,7 +21,7 @@ pycaw>=20240210; sys_platform == 'win32'
 # Browser control. A page already knows its own structure, so reading the
 # DOM beats reading a picture of it. After installing, fetch the browser:
 #     playwright install chromium
-playwright>=1.44
+playwright>=1.48
 
 # --- optional, but recommended -------------------------------------------
 # PDF text extraction and page surgery. Document text extraction for
@@ -38,3 +38,9 @@ pywin32>=306; sys_platform == 'win32'
 faster-whisper>=1.0
 av>=12.0            # decodes the OGG/Opus that Telegram sends
 # vosk>=0.3.45      # uncomment for the lightweight alternative
+
+# Machine pressure, battery and power signals for the resource governor.
+psutil>=5.9
+
+# Secrets (bot token, LLM key, audit key) live in Windows Credential Manager.
+keyring>=24.0
