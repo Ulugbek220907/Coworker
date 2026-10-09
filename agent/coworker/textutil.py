@@ -4,11 +4,21 @@ The whole point of this module: a file named ``Договор_текстиль_2
 sitting in ``D:\\Ишхона\\Шартномалар`` must be findable by someone who typed
 "tekstil shartnoma" on a Latin keyboard. Everything is folded down to one
 comparable Latin form before any matching happens.
+
+Scoring rules that matter to callers:
+
+* A prefix match needs a matched prefix of at least ``MIN_PREFIX`` characters.
+  Two-letter fragments such as the ``ma`` in ``Ma.pdf`` used to earn credit for
+  any longer query that began with them (``malika`` scored 0.98 against it).
+* ``prepare(query)`` normalises a query once. The scoring functions accept
+  either a string or a prepared ``Query``, so a search over thousands of
+  candidate names does not repeat that work for every candidate.
 """
 from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 
 # Covers Russian and Uzbek Cyrillic alike. Multi-character values are fine;
 # the table is applied character by character.
@@ -25,8 +35,19 @@ _CYR = {
 # Uzbek Latin uses several apostrophe glyphs interchangeably; drop them all.
 _APOSTROPHES = "\u02bb\u02bc\u2018\u2019\u0027\u0060\u00b4"
 
+# Prefix credit needs a shared prefix of at least MIN_PREFIX characters. A short
+# *target* word cannot be a prefix of a longer query word: "ma" in "Ma.pdf" is
+# not a match for "malika". A query word must also be MIN_QUERY_PREFIX long to
+# earn credit as a prefix of a longer target word. That floor is kept at four
+# because "tel" (three letters) scoring 0.98 against both Telegram Desktop and
+# Telemost disabled the launcher's ambiguity prompt.
+MIN_PREFIX = 3
+MIN_QUERY_PREFIX = 4
+
 # Suffixes worth trimming so that "shartnomani" still matches "shartnoma".
-# Longest first - the loop stops at the first hit.
+# Longest first - the loop stops at the first hit. Words are transliterated
+# before they are stemmed, so every token here is Latin. The Russian endings
+# that once sat in this list could never match and have been removed.
 _SUFFIXES = (
     # Uzbek case/possessive endings
     "larimizning", "laringizning", "larining", "larimiz", "laringiz",
@@ -34,10 +55,6 @@ _SUFFIXES = (
     "larda", "lardan", "larni", "lar", "ning", "imiz", "ingiz", "iga",
     "ida", "idan", "ini", "imni", "miz", "ngiz", "ga", "da", "dan", "ni",
     "si", "im", "ing", "i",
-    # Russian noun/adjective endings
-    "ами", "ями", "ого", "ему", "ыми", "ими", "ов", "ев", "ам", "ям",
-    "ах", "ях", "ой", "ый", "ий", "ая", "ое", "ые", "ие", "ом", "ем",
-    "ах", "у", "ы", "а", "е", "о", "я", "ю", "и",
 )
 
 _WORD = re.compile(r"[0-9a-zA-Zа-яёА-ЯЁғқҳўҒҚҲЎ]+")
@@ -52,6 +69,27 @@ def translit(text: str) -> str:
             continue
         out.append(_CYR.get(ch, ch))
     return "".join(out)
+
+
+def translit_with_offsets(text: str) -> tuple[str, list[int]]:
+    """Like :func:`translit`, but each output character also records which
+    character of ``text`` produced it.
+
+    Transliteration changes lengths (``ё`` becomes ``yo``, apostrophes vanish),
+    so a position found in the folded form cannot be used to slice the original
+    text directly. ``offsets[i]`` is the index in ``text`` of the character that
+    produced ``folded[i]``.
+    """
+    chars: list[str] = []
+    offsets: list[int] = []
+    for index, raw in enumerate(text):
+        for ch in unicodedata.normalize("NFKC", raw).lower():
+            if ch in _APOSTROPHES:
+                continue
+            for out in _CYR.get(ch, ch):
+                chars.append(out)
+                offsets.append(index)
+    return "".join(chars), offsets
 
 
 def normalize(text: str) -> str:
@@ -98,14 +136,56 @@ STOPWORDS = {
 }
 
 
-def score(query: str, target: str) -> float:
+def _prefix_related(query_word: str, target_word: str) -> bool:
+    """Prefix credit between a query word and a target word.
+
+    The query word may begin the target word when it is MIN_QUERY_PREFIX long.
+    The target word may begin the query word when it is MIN_PREFIX long, which is
+    the case that made "ma" in "Ma.pdf" match "malika".
+    """
+    if target_word.startswith(query_word) and len(query_word) >= MIN_QUERY_PREFIX:
+        return True
+    return query_word.startswith(target_word) and len(target_word) >= MIN_PREFIX
+
+
+@dataclass(frozen=True)
+class Query:
+    """A query after normalisation. Build it with :func:`prepare` and reuse it.
+
+    ``tokens`` are the stemmed query words, ``groups`` holds each word's
+    cross-language variants (one tuple per word) and ``terms`` is the flattened,
+    deduplicated list of those variants.
+    """
+
+    text: str
+    tokens: tuple[str, ...]
+    groups: tuple[tuple[str, ...], ...]
+    terms: tuple[str, ...]
+
+
+def prepare(query: "str | Query") -> Query:
+    """Normalise a query once. A prepared query is returned unchanged."""
+    if isinstance(query, Query):
+        return query
+    text = query or ""
+    base = tokens(text)
+    groups = tuple(SYNONYMS.get(t, (t,)) for t in base)
+    terms: list[str] = []
+    for group in groups:
+        for variant in group:
+            if variant not in terms:
+                terms.append(variant)
+    return Query(text=text, tokens=tuple(base), groups=groups, terms=tuple(terms))
+
+
+def score(query: "str | Query", target: str) -> float:
     """How well ``target`` (a filename or path) answers ``query``.
 
     Returns roughly 0..1. Prefix matching is what makes morphology-rich
     languages work here: "shartnom" matches "shartnomasi" without a real
     stemmer being involved.
     """
-    q = tokens(query)
+    q = prepare(query).tokens
     if not q:
         return 0.0
     t = tokens(target, do_stem=False)
@@ -118,11 +198,11 @@ def score(query: str, target: str) -> float:
         if qt in t_stemmed or qt in t:
             hits += 1.0
             continue
-        # Partial credit when the query token is a prefix of a target token
-        # (or the other way round) - covers truncation and extra suffixes.
+        # Partial credit when one token is a prefix of the other - covers
+        # truncation and extra suffixes, but never a two-letter fragment.
         best = 0.0
         for tt in t:
-            if len(qt) >= 4 and (tt.startswith(qt) or qt.startswith(tt)):
+            if _prefix_related(qt, tt):
                 best = max(best, 0.85)
             elif len(qt) >= 5 and qt in tt:
                 best = max(best, 0.6)
@@ -175,37 +255,47 @@ for _group in _SYNONYM_GROUPS:
         SYNONYMS.setdefault(_w, _stems)
 
 
-def expand(query: str) -> list[str]:
+def expand(query: "str | Query") -> list[str]:
     """Query tokens plus their cross-language equivalents."""
-    base = tokens(query)
-    out, seen = [], set()
-    for t in base:
-        for variant in SYNONYMS.get(t, (t,)):
-            if variant not in seen:
-                seen.add(variant)
-                out.append(variant)
-    return out
+    return list(prepare(query).terms)
 
 
-def score_expanded(query: str, target: str) -> float:
+def score_expanded(query: "str | Query", target: str) -> float:
     """Like :func:`score`, but a synonym hit counts almost as much as a
     literal one. Matching the user's own wording still ranks higher."""
-    direct = score(query, target)
-    groups = [SYNONYMS.get(t, (t,)) for t in tokens(query)]
-    if not groups or all(len(g) == 1 for g in groups):
+    q = prepare(query)
+    direct = score(q, target)
+    if not q.groups or all(len(g) == 1 for g in q.groups):
         return direct
 
     t_tokens = tokens(target, do_stem=False)
     t_stemmed = [stem(w) for w in t_tokens]
     hits = 0.0
-    for group in groups:
+    for group in q.groups:
         best = 0.0
         for variant in group:
             for tt in t_stemmed + t_tokens:
                 if variant == tt:
                     best = max(best, 1.0)
-                elif len(variant) >= 4 and (tt.startswith(variant) or variant.startswith(tt)):
+                elif _prefix_related(variant, tt):
                     best = max(best, 0.8)
         hits += best
-    via_synonym = (hits / len(groups)) * 0.9  # slight penalty vs. a direct hit
+    via_synonym = (hits / len(q.groups)) * 0.9  # slight penalty vs. a direct hit
     return max(direct, min(1.0, via_synonym))
+
+
+def snippet(text: str, term: str, width: int = 160) -> str:
+    """A window of the original ``text`` around the first match of ``term``.
+
+    The match is located in the folded text and mapped back to the original
+    offset, so the window shows the words that matched even when the text
+    contains characters that fold to a different length.
+    """
+    folded, offsets = translit_with_offsets(text)
+    idx = folded.find(term) if term else -1
+    if idx < 0:
+        return text[:width].replace("\n", " ")
+    start = max(0, offsets[idx] - width // 3)
+    end = min(len(text), start + width)
+    body = text[start:end].replace("\n", " ")
+    return ("..." if start else "") + body + ("..." if end < len(text) else "")

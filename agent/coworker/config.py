@@ -7,14 +7,22 @@ one re-pairing, nothing more.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
-import secrets
 import uuid
 from pathlib import Path
 from typing import Any
 
+from .store.secrets import SecretStoreError, get_secret, set_secret
+
+log = logging.getLogger("config")
+
 APP_NAME = "Coworker"
+
+# Credentials never reach config.json. They live in the OS keyring (see
+# store/secrets.py), and Config.save() drops them even if they are in memory.
+SECRET_KEYS = ("llm_api_key", "relay_token")
 
 # Files that should never leave the machine, whatever the model decides.
 # Matched case-insensitively as substrings of the filename.
@@ -28,11 +36,10 @@ DEFAULTS: dict[str, Any] = {
     "agent_id": "",
     "name": "",
     "server_url": "http://127.0.0.1:8000",
-    "relay_token": "",
 
     # LLM - any OpenAI-compatible endpoint works (DeepSeek, GLM, Ollama, ...).
+    # The API key itself is a secret; see SECRET_KEYS.
     "llm_base_url": "https://api.deepseek.com",
-    "llm_api_key": "",
     "llm_model": "deepseek-chat",
 
     # Search scope. Empty roots means "every fixed drive".
@@ -43,6 +50,14 @@ DEFAULTS: dict[str, Any] = {
 
     # Behaviour
     "autostart": False,
+    # ask_always | ask_for_writes | autonomous_readonly  (see core.types.Autonomy)
+    "autonomy": "ask_for_writes",
+    # Tool families the owner has switched off, on top of the grants above.
+    "disabled_families": [],
+    # File deletion stays off until the owner has checked the Recycle Bin path on this PC.
+    "recycle_verified": False,
+    # Where generated files go. Empty means COWORKER_HOME/scratch; see Config.scratch_dir.
+    "scratch_dir": "",
     "auto_send_single_hit": True,   # one confident match -> just send it
     "reply_language": "auto",       # auto | uz | ru
     "max_reply_chars": 600,
@@ -101,13 +116,21 @@ CAP_LABELS = {
 
 
 def config_dir() -> Path:
-    if os.name == "nt":
-        base = Path(os.getenv("APPDATA") or Path.home() / "AppData" / "Roaming")
-    elif platform.system() == "Darwin":
-        base = Path.home() / "Library" / "Application Support"
+    """The folder for config, store, chats and scratch files.
+
+    COWORKER_HOME overrides the per-user location; tests and portable installs use it.
+    """
+    override = os.getenv("COWORKER_HOME", "").strip()
+    if override:
+        d = Path(override)
     else:
-        base = Path(os.getenv("XDG_CONFIG_HOME") or Path.home() / ".config")
-    d = base / APP_NAME
+        if os.name == "nt":
+            base = Path(os.getenv("APPDATA") or Path.home() / "AppData" / "Roaming")
+        elif platform.system() == "Darwin":
+            base = Path.home() / "Library" / "Application Support"
+        else:
+            base = Path(os.getenv("XDG_CONFIG_HOME") or Path.home() / ".config")
+        d = base / APP_NAME
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -116,13 +139,14 @@ class Config:
     def __init__(self, path: Path | None = None) -> None:
         self.path = path or (config_dir() / "config.json")
         self.data: dict[str, Any] = dict(DEFAULTS)
+        # Secrets the keyring refused to take. Held for this run only; never written.
+        self._session_secrets: dict[str, str] = {}
         self.load()
-        # A fresh install needs a stable identity and a one-time pair code.
+        # A fresh install needs a stable identity. Pairing codes live in the store.
         if not self.data.get("agent_id"):
             self.data["agent_id"] = uuid.uuid4().hex
         if not self.data.get("name"):
             self.data["name"] = platform.node() or "PC"
-        self.pair_code = f"{secrets.randbelow(900000) + 100000}"
         self.save()
 
     # ------------------------------------------------------------ persistence
@@ -132,16 +156,28 @@ class Config:
             return
         try:
             stored = json.loads(self.path.read_text(encoding="utf-8"))
-            if isinstance(stored, dict):
-                self.data.update(stored)
         except (json.JSONDecodeError, OSError):
-            pass  # a corrupt config should not stop the app from starting
+            return  # a corrupt config should not stop the app from starting
+        if not isinstance(stored, dict):
+            return
+        # Secrets written by an older version move to the keyring now, and the
+        # file is rewritten without them.
+        moved = False
+        for key in SECRET_KEYS:
+            value = stored.pop(key, "")
+            if value:
+                self._store_secret(key, str(value))
+                moved = True
+        self.data.update(stored)
+        if moved:
+            self.save()
 
     def save(self) -> None:
+        payload = {key: value for key, value in self.data.items() if key not in SECRET_KEYS}
         try:
             tmp = self.path.with_suffix(".tmp")
             tmp.write_text(
-                json.dumps(self.data, ensure_ascii=False, indent=2), encoding="utf-8"
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
             )
             tmp.replace(self.path)
         except OSError:
@@ -150,11 +186,36 @@ class Config:
     # --------------------------------------------------------------- access
 
     def get(self, key: str, default: Any = None) -> Any:
+        if key in SECRET_KEYS:
+            return self._secret(key)
         return self.data.get(key, DEFAULTS.get(key, default))
 
     def set(self, key: str, value: Any) -> None:
+        if key in SECRET_KEYS:
+            self._store_secret(key, str(value or ""))
+            return
         self.data[key] = value
         self.save()
+
+    def _secret(self, key: str) -> str:
+        return self._session_secrets.get(key) or get_secret(key) or ""
+
+    def _store_secret(self, key: str, value: str) -> None:
+        try:
+            set_secret(key, value)
+        except SecretStoreError:
+            log.warning("no keyring is available; %s is kept for this run only", key)
+            self._session_secrets[key] = value
+            return
+        self._session_secrets.pop(key, None)
+
+    @property
+    def scratch_dir(self) -> Path:
+        """Folder for generated files such as PDF conversions. Created on first use."""
+        override = str(self.get("scratch_dir", "") or "")
+        d = Path(override) if override else config_dir() / "scratch"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
 
     # ----------------------------------------------------------- trust list
 

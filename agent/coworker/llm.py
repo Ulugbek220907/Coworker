@@ -1,139 +1,158 @@
-"""Minimal async client for any OpenAI-compatible chat endpoint.
+"""OpenAI-compatible chat endpoints (dialect "openai"): DeepSeek, GLM, Groq, OpenRouter, Ollama.
 
-Kept provider-agnostic on purpose: DeepSeek today, a local Ollama model or a
-free GLM tier tomorrow, without touching the rest of the codebase. Only two
-things are actually required of the endpoint - ``/chat/completions`` and
-function calling.
+Only two things are required of such an endpoint: /chat/completions and function calling.
+The presets are what the settings window offers; the adapter does not care which one was
+picked. The Claude presets use the Anthropic dialect and are served by llm_anthropic.py.
+
+DeepSeek-style reasoning models may put their thinking in reasoning_content and leave the
+answer empty, usually when max_tokens runs out mid-thought. The last line of that thinking
+is then the best available answer, so it is salvaged rather than returning nothing. The
+salvage is skipped when the reply carries tool calls, because thinking is not an answer.
 """
 from __future__ import annotations
 
 import asyncio
 import json
-import logging
 from typing import Any
 
 import httpx
 
-log = logging.getLogger("llm")
+from .llm_base import (
+    MAX_RETRIES,
+    NO_ANSWER,
+    HttpChatProvider,
+    Msg,
+    ProviderError,
+    Sleep,
+    ToolCallReq,
+    Turn,
+    normalize_stop,
+    parse_arguments,
+)
 
-# Presets the settings window offers. base_url is what gets "/chat/completions"
-# appended to it.
+# base_url is what gets "/chat/completions" appended to it. dialect selects the adapter.
 PROVIDERS: dict[str, dict[str, str]] = {
     "DeepSeek": {
         "base_url": "https://api.deepseek.com",
         "model": "deepseek-chat",
+        "dialect": "openai",
         "hint": "platform.deepseek.com - arzon, tez, tool-calling bor",
     },
     "GLM (BigModel)": {
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "model": "glm-4-flash",
+        "dialect": "openai",
         "hint": "bigmodel.cn - glm-4-flash bepul",
     },
     "GLM (z.ai)": {
         "base_url": "https://api.z.ai/api/paas/v4",
         "model": "glm-4.5-flash",
+        "dialect": "openai",
         "hint": "z.ai - xalqaro endpoint",
     },
     "Groq": {
         "base_url": "https://api.groq.com/openai/v1",
         "model": "llama-3.3-70b-versatile",
+        "dialect": "openai",
         "hint": "groq.com - bepul tier, juda tez",
     },
     "OpenRouter": {
         "base_url": "https://openrouter.ai/api/v1",
         "model": "deepseek/deepseek-chat-v3.1:free",
+        "dialect": "openai",
         "hint": "openrouter.ai - :free modellari bor",
     },
     "Ollama (lokal)": {
         "base_url": "http://localhost:11434/v1",
         "model": "qwen2.5:7b",
+        "dialect": "openai",
         "hint": "Kompyuterning o'zida, internetsiz va butunlay bepul",
+    },
+    "Claude Sonnet 5.5": {
+        "base_url": "https://api.anthropic.com",
+        "model": "claude-sonnet-5-5",
+        "dialect": "anthropic",
+        "hint": "console.anthropic.com - aqlli va kuchli model",
+    },
+    "Claude Haiku 5.5": {
+        "base_url": "https://api.anthropic.com",
+        "model": "claude-haiku-5-5",
+        "dialect": "anthropic",
+        "hint": "console.anthropic.com - tez va arzon model",
     },
 }
 
 
-class LLMError(RuntimeError):
-    pass
+class OpenAICompatProvider(HttpChatProvider):
+    """Chat and vision through an OpenAI-compatible /chat/completions endpoint."""
 
+    dialect = "openai"
 
-class LLM:
-    def __init__(self, base_url: str, api_key: str, model: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        model: str,
+        *,
+        name: str = "openai-compatible",
+        vision_model: str = "",
+        transport: httpx.AsyncBaseTransport | None = None,
+        sleep: Sleep = asyncio.sleep,
+        max_retries: int = MAX_RETRIES,
+    ) -> None:
+        super().__init__(
+            name=name,
+            api_key=api_key,
+            transport=transport,
+            sleep=sleep,
+            max_retries=max_retries,
+        )
         self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
         self.model = model
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(90.0, connect=15.0))
-
-    async def close(self) -> None:
-        await self._client.aclose()
+        self.vision_model = vision_model or model
 
     async def chat(
         self,
-        messages: list[dict],
+        system: str,
+        messages: list[Msg],
+        tools: list[dict],
         *,
-        tools: list[dict] | None = None,
+        max_tokens: int,
         temperature: float = 0.2,
-        max_tokens: int = 700,
-        retries: int = 2,
-    ) -> dict:
-        """One completion. Returns the assistant message dict."""
+    ) -> Turn:
         payload: dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": _wire_messages(system, messages),
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
+        data = await self.post_json(
+            f"{self.base_url}/chat/completions", payload, self._headers()
+        )
+        choice = _first_choice(data)
+        message = choice.get("message") or {}
+        calls = _tool_calls(message.get("tool_calls"))
+        text = str(message.get("content") or "").strip()
+        if not text and not calls:
+            text = _salvage(message)
+        return Turn(
+            text=text,
+            tool_calls=calls,
+            stop_reason=normalize_stop(str(choice.get("finish_reason") or "")),
+            usage=data.get("usage") or {},
+        )
 
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
+    async def vision(self, prompt: str, image_b64: str, *, max_tokens: int = 1200) -> str:
+        """One image and one prompt, sent as an image_url content part of the same endpoint.
 
-        last_error = ""
-        for attempt in range(retries + 1):
-            try:
-                r = await self._client.post(
-                    f"{self.base_url}/chat/completions", json=payload, headers=headers
-                )
-                if r.status_code == 200:
-                    data = r.json()
-                    choices = data.get("choices") or []
-                    if not choices:
-                        raise LLMError("javob bo'sh keldi")
-                    return choices[0].get("message", {})
-
-                last_error = _describe(r)
-                # 4xx other than rate limiting will not fix themselves.
-                if r.status_code < 500 and r.status_code != 429:
-                    raise LLMError(last_error)
-            except httpx.HTTPError as exc:
-                last_error = f"tarmoq xatosi: {exc}"
-
-            if attempt < retries:
-                await asyncio.sleep(1.5 * (attempt + 1))
-
-        raise LLMError(last_error or "noma'lum xato")
-
-    async def vision(
-        self,
-        prompt: str,
-        image_b64: str,
-        *,
-        model: str,
-        max_tokens: int = 1600,
-    ) -> str:
-        """One image + prompt call, against a vision-capable model.
-
-        deepseek-flash reasons before answering: its thinking goes to
-        reasoning_content and the real answer to content. If max_tokens is too
-        small it runs out mid-thought and content comes back empty - which is
-        how "screen_now" ended up full of "We need answer in Uzbek likely...".
-        So the budget is generous, and if content is still empty the last line
-        of the reasoning is used rather than the whole rambling trace.
+        The budget is generous on purpose: a reasoning model that runs out of tokens
+        mid-thought returns empty content, which is why the salvage applies here too.
         """
         payload = {
-            "model": model,
+            "model": self.vision_model,
             "messages": [{
                 "role": "user",
                 "content": [
@@ -145,47 +164,86 @@ class LLM:
             "max_tokens": max_tokens,
             "temperature": 0.1,
         }
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            headers["Authorization"] = f"Bearer {self.api_key}"
-
-        r = await self._client.post(
-            f"{self.base_url}/chat/completions", json=payload, headers=headers
+        data = await self.post_json(
+            f"{self.base_url}/chat/completions", payload, self._headers()
         )
-        if r.status_code != 200:
-            raise LLMError(_describe(r))
-        choices = r.json().get("choices") or []
-        if not choices:
-            raise LLMError("vision javobi bo'sh")
-        msg = choices[0].get("message", {})
-        text = (msg.get("content") or "").strip()
-        if not text:
-            # Salvage a conclusion from the reasoning rather than dumping the
-            # whole "We need to analyse..." trace back to the caller.
-            reasoning = (msg.get("reasoning_content") or "").strip()
-            tail = [ln.strip() for ln in reasoning.splitlines() if ln.strip()]
-            text = tail[-1] if tail else ""
-        return text or "(javob olinmadi — qayta urinib ko'ring)"
+        message = _first_choice(data).get("message") or {}
+        text = str(message.get("content") or "").strip() or _salvage(message)
+        return text or NO_ANSWER
 
-    async def ping(self) -> tuple[bool, str]:
-        """Used by the settings window's Test button."""
-        try:
-            msg = await self.chat(
-                [{"role": "user", "content": "ping"}], max_tokens=5, retries=0
-            )
-            return True, (msg.get("content") or "ok")[:60]
-        except Exception as exc:
-            return False, str(exc)[:200]
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
 
 
-def _describe(r: httpx.Response) -> str:
-    try:
-        body = r.json()
-        err = body.get("error")
-        if isinstance(err, dict):
-            return f"{r.status_code}: {err.get('message', '')}"
-        if isinstance(err, str):
-            return f"{r.status_code}: {err}"
-        return f"{r.status_code}: {json.dumps(body, ensure_ascii=False)[:200]}"
-    except Exception:
-        return f"{r.status_code}: {r.text[:200]}"
+def _wire_messages(system: str, messages: list[Msg]) -> list[dict[str, Any]]:
+    wire: list[dict[str, Any]] = []
+    if system:
+        wire.append({"role": "system", "content": system})
+    for msg in messages:
+        if msg.role == "tool":
+            item: dict[str, Any] = {
+                "role": "tool",
+                "tool_call_id": msg.tool_call_id,
+                "content": msg.content or "",
+            }
+            if msg.name:
+                item["name"] = msg.name
+            wire.append(item)
+        elif msg.role == "assistant" and msg.tool_calls:
+            wire.append({
+                "role": "assistant",
+                "content": msg.content or None,
+                "tool_calls": [
+                    {
+                        "id": call.id,
+                        "type": "function",
+                        "function": {
+                            "name": call.name,
+                            "arguments": json.dumps(call.args, ensure_ascii=False),
+                        },
+                    }
+                    for call in msg.tool_calls
+                ],
+            })
+        else:
+            wire.append({"role": msg.role, "content": msg.content or ""})
+    return wire
+
+
+def _first_choice(data: dict[str, Any]) -> dict[str, Any]:
+    choices = data.get("choices") or []
+    if not choices or not isinstance(choices[0], dict):
+        raise ProviderError("javob bo'sh keldi")
+    return choices[0]
+
+
+def _tool_calls(raw: Any) -> list[ToolCallReq]:
+    calls: list[ToolCallReq] = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        function = item.get("function") or {}
+        calls.append(ToolCallReq(
+            id=str(item.get("id") or ""),
+            name=str(function.get("name") or ""),
+            args=parse_arguments(function.get("arguments")),
+        ))
+    return calls
+
+
+def _salvage(message: dict[str, Any]) -> str:
+    """The last non-empty line of reasoning_content.
+
+    Whole traces are never returned: they read to the owner as "We need to answer in Uzbek...".
+    """
+    lines = [
+        line.strip()
+        for line in str(message.get("reasoning_content") or "").splitlines()
+        if line.strip()
+    ]
+    return lines[-1] if lines else ""
+
+
+# Names the legacy modules (app.py, brain.py, ui.py) still import. They go with those modules.
+LLM = OpenAICompatProvider
+LLMError = ProviderError

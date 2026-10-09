@@ -1,64 +1,136 @@
-"""Tkinter control panel for the desktop agent.
+"""The desktop window: a header, the emergency row and five tabs.
 
-Tkinter ships with Python, so the packaged app stays small and needs no extra
-runtime. The asyncio side runs on its own thread; every UI update is marshalled
-back through ``root.after`` because Tk is not thread-safe.
+Tabs: Ulanish (pairing and pending approvals), Rejim (autonomy and tool families),
+Audit, Sozlamalar (settings) and Jurnal (the log).
+
+Threads. The runtime runs on its own thread (asyncio.run(runtime.run())). Its status
+callback, the log handler and the tray only put items on queues. The Tk thread
+drains them every DRAIN_MS and makes every widget change, so no Tk call happens on
+any other thread. The runtime is imported lazily so importing this module opens no
+window and loads no assistant code.
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import queue
 import signal
 import threading
-import time
 import tkinter as tk
-import webbrowser
 from tkinter import messagebox, ttk
+from typing import Any
 
 from . import tray as tray_mod
-from .app import CoworkerAgent
-from .config import ALL_CAPS, CAP_FIND, CAP_LABELS, Config
-from .llm import PROVIDERS
+from .config import Config
+from .tools.registry import FAMILIES
+from .transport.bot import install_redaction
+from .ui_panels import (
+    ACCENT, AUTONOMY_LABELS, AUTONOMY_LEVELS, BAD, BG, CARD, FG, MUTED, OK, WARN,
+    LogPanel, QueueLogHandler, SettingsPanel,
+    approval_channel, approval_text, autonomy_explanation, button, checkbox,
+    connect_command, disabled_from_states, drain_queue, family_label, family_states,
+    format_audit_row, label_title, muted, needs_local_approval, normalize_autonomy,
+    owner_line, status_line, unexpired, verify_text,
+)
 
-BG = "#12151c"
-CARD = "#1a1f2a"
-FG = "#e8ecf3"
-MUTED = "#8a94a6"
-ACCENT = "#4a9eff"
-OK = "#3ddc84"
-WARN = "#ffb020"
-BAD = "#ff5c5c"
+log = logging.getLogger("ui")
 
-STATE_STYLE = {
-    "online": (OK, "Ulangan"),
-    "paired": (OK, "Telefon ulandi"),
-    "working": (ACCENT, "Ishlayapti"),
-    "connecting": (WARN, "Ulanmoqda"),
-    "offline": (BAD, "Aloqa yo'q"),
-}
+DRAIN_MS = 200
+LIVE_EVERY = 15          # ticks between refreshes of approvals and panic state (about 3 s)
+MAX_APPROVALS = 10
+MUTEX_NAME = "Local\\CoworkerDesktopAgent"
+ERROR_ALREADY_EXISTS = 183
+_mutex_handle: Any = None
 
+
+class EventBus:
+    """Thread-safe queue of work for the Tk thread: status changes and tray requests."""
+
+    def __init__(self) -> None:
+        self._items: queue.Queue[tuple[str, Any]] = queue.Queue()  # unbounded: no status may be lost
+
+    def status(self, state: str, detail: str) -> None:
+        """The runtime's status callback. Called from any thread."""
+        self._items.put(("status", (str(state), str(detail))))
+
+    def post(self, kind: str, payload: Any = None) -> None:
+        self._items.put((kind, payload))
+
+    def drain(self) -> list[tuple[str, Any]]:
+        return drain_queue(self._items)
+
+
+# ------------------------------------------------------------ process level
+
+def claim_single_instance() -> bool:
+    """True when this is the only running copy. The mutex handle lives as long as the process."""
+    global _mutex_handle
+    if os.name != "nt":
+        return True
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel32.CreateMutexW
+    create.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    create.restype = wintypes.HANDLE
+    handle = create(None, False, MUTEX_NAME)
+    if not handle:
+        log.warning("the single-instance mutex could not be created; starting anyway")
+        return True
+    _mutex_handle = handle
+    return ctypes.get_last_error() != ERROR_ALREADY_EXISTS
+
+
+def notify_already_running() -> None:
+    _message("Coworker", "Coworker allaqachon ishlayapti. Tray belgisidan oynani oching.")
+
+
+def show_fatal(text: str) -> None:
+    _message("Coworker", text, error=True)
+
+
+def _message(title: str, text: str, error: bool = False) -> None:
+    root = tk.Tk()
+    root.withdraw()
+    try:
+        (messagebox.showerror if error else messagebox.showinfo)(title, text, parent=root)
+    finally:
+        root.destroy()
+
+
+# ------------------------------------------------------------------ window
 
 class AgentWindow:
     def __init__(self, cfg: Config) -> None:
+        from .runtime import Runtime  # deferred: the runtime pulls in the whole assistant
+
         self.cfg = cfg
-        self.events: queue.Queue[tuple[str, str]] = queue.Queue()
-        self.agent: CoworkerAgent | None = None
-        self.loop: asyncio.AbstractEventLoop | None = None
-        self.tray = tray_mod.Tray(lambda: None, lambda: None)
+        self.bus = EventBus()
+        self.log_handler = QueueLogHandler()
+        root_logger = logging.getLogger()
+        root_logger.addHandler(self.log_handler)
+        root_logger.setLevel(logging.INFO)
+        install_redaction()
+        self.runtime: Any = Runtime(cfg, status=self.bus.status)
+        self.tray = tray_mod.Tray(self.runtime, on_show=lambda: self.bus.post("show"))
         self.has_tray = False
         self._told_about_tray = False
-        self._caps_chat: int | None = None   # which chat the checkboxes show
+        self._code = ""
+        self._code_synced = False  # True once a code was issued after the runtime started
+        self._state, self._detail = "starting", ""
+        self._approval_sig: Any = None
+        self._ticks = 0
 
         self.root = tk.Tk()
         self.root.title("Coworker")
-        self.root.geometry("560x640")
-        self.root.minsize(520, 560)
+        self.root.geometry("600x740")
+        self.root.minsize(540, 600)
         self.root.configure(bg=BG)
-
-        self._build()
-        self.root.after(120, self._drain)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._build()
+        self.root.after(DRAIN_MS, self._tick)
 
     # ------------------------------------------------------------------ view
 
@@ -69,441 +141,335 @@ class AgentWindow:
         except tk.TclError:
             pass
         style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=CARD, foreground=MUTED, padding=(16, 8))
+        style.configure("TNotebook.Tab", background=CARD, foreground=MUTED, padding=(14, 7))
         style.map("TNotebook.Tab", background=[("selected", BG)], foreground=[("selected", FG)])
-        style.configure("TFrame", background=BG)
 
-        header = tk.Frame(self.root, bg=BG)
-        header.pack(fill="x", padx=20, pady=(18, 10))
-        tk.Label(header, text="Coworker", bg=BG, fg=FG,
+        head = tk.Frame(self.root, bg=BG)
+        head.pack(fill="x", padx=20, pady=(16, 8))
+        tk.Label(head, text=str(self.cfg.get("name") or "Coworker"), bg=BG, fg=FG,
                  font=("Segoe UI Semibold", 20)).pack(anchor="w")
-        tk.Label(header, text=f"{self.cfg.get('name')} · hujjat yordamchisi",
-                 bg=BG, fg=MUTED, font=("Segoe UI", 9)).pack(anchor="w")
+        tk.Label(head, text="Coworker · kompyuter yordamchisi", bg=BG, fg=MUTED,
+                 font=("Segoe UI", 9)).pack(anchor="w")
 
-        # Status pill
-        status_card = tk.Frame(self.root, bg=CARD)
-        status_card.pack(fill="x", padx=20, pady=(0, 12))
-        inner = tk.Frame(status_card, bg=CARD)
-        inner.pack(fill="x", padx=16, pady=12)
-        self.dot = tk.Label(inner, text="●", bg=CARD, fg=BAD, font=("Segoe UI", 14))
+        card = tk.Frame(self.root, bg=CARD)
+        card.pack(fill="x", padx=20, pady=(0, 4))
+        row = tk.Frame(card, bg=CARD)
+        row.pack(fill="x", padx=16, pady=10)
+        self.dot = tk.Label(row, text="●", bg=CARD, fg=WARN, font=("Segoe UI", 14))
         self.dot.pack(side="left", padx=(0, 8))
-        self.status_text = tk.Label(inner, text="Ishga tushmoqda...", bg=CARD, fg=FG,
-                                    font=("Segoe UI Semibold", 11))
-        self.status_text.pack(side="left")
+        self.status = tk.Label(row, text="Ishga tushmoqda...", bg=CARD, fg=FG,
+                               font=("Segoe UI Semibold", 11))
+        self.status.pack(side="left")
+        self.note = muted(self.root, "", size=9)
+        self.note.pack(anchor="w", padx=22, pady=(0, 6))
 
-        notebook = ttk.Notebook(self.root)
-        notebook.pack(fill="both", expand=True, padx=20, pady=(0, 16))
-        notebook.add(self._tab_main(notebook), text="  Ulanish  ")
-        notebook.add(self._tab_settings(notebook), text="  Sozlamalar  ")
-        notebook.add(self._tab_log(notebook), text="  Jurnal  ")
+        self._build_emergency()
 
-    def _tab_main(self, parent: ttk.Notebook) -> tk.Frame:
-        f = tk.Frame(parent, bg=BG)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill="both", expand=True, padx=20, pady=(0, 14))
+        self.notebook.add(self._tab_link(), text="  Ulanish  ")
+        self.notebook.add(self._tab_policy(), text="  Rejim  ")
+        self.notebook.add(self._tab_audit(), text="  Audit  ")
+        self.notebook.add(self._tab_settings(), text="  Sozlamalar  ")
+        self.notebook.add(self._tab_log(), text="  Jurnal  ")
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab)
+        self._refresh_live()
 
-        tk.Label(f, text="TELEFONNI ULASH", bg=BG, fg=MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(16, 6))
+    def _build_emergency(self) -> None:
+        box = tk.Frame(self.root, bg=CARD)
+        box.pack(fill="x", padx=20, pady=(0, 6))
+        inner = tk.Frame(box, bg=CARD)
+        inner.pack(fill="x", padx=14, pady=(10, 4))
+        button(inner, "STOP", self._stop, kind="warn").pack(side="left")
+        button(inner, "PANIC", self._panic, kind="danger").pack(side="left", padx=8)
+        button(inner, "Qayta yoqish (faqat shu kompyuterdan)", self._resume, kind="quiet").pack(side="left")
+        self.panic_label = tk.Label(inner, text="", bg=CARD, fg=BAD, font=("Segoe UI Semibold", 9))
+        self.panic_label.pack(side="right")
+        tk.Label(box, text=("STOP: hozirgi ishlar bekor qilinadi. PANIC: hamma amallar to'xtaydi. "
+                            "Qayta yoqish Telegram orqali emas, faqat shu oynadan mumkin."),
+                 bg=CARD, fg=MUTED, font=("Segoe UI", 8), wraplength=520,
+                 justify="left").pack(anchor="w", padx=14, pady=(0, 10))
 
+    def _tab_link(self) -> tk.Frame:
+        f = tk.Frame(self.notebook, bg=BG)
+        label_title(f, "Telefonni ulash")
         card = tk.Frame(f, bg=CARD)
         card.pack(fill="x")
-        tk.Label(card, text="Telegramda @ulugcoworkerbot ga yozing:",
-                 bg=CARD, fg=MUTED, font=("Segoe UI", 9)).pack(pady=(14, 4))
-        self.code_label = tk.Label(card, text=f"/connect {self.cfg.pair_code}", bg=CARD,
-                                   fg=ACCENT, font=("Consolas", 20, "bold"))
-        self.code_label.pack(pady=(0, 6))
-        tk.Label(card, text="Kod ilova yopilguncha amal qiladi", bg=CARD, fg=MUTED,
-                 font=("Segoe UI", 8)).pack(pady=(0, 12))
+        muted(card, "Telegram botingizga shu buyruqni yuboring:", bg=CARD).pack(pady=(14, 4))
+        self.code_label = tk.Label(card, text="—", bg=CARD, fg=ACCENT, font=("Consolas", 20, "bold"))
+        self.code_label.pack(pady=(0, 4))
+        muted(card, "Kod 10 daqiqa amal qiladi. Yangisini olsangiz, eskisi ishlamaydi.",
+              bg=CARD).pack(pady=(0, 10))
+        btns = tk.Frame(card, bg=CARD)
+        btns.pack(pady=(0, 12))
+        button(btns, "Nusxalash", self._copy_code).pack(side="left")
+        button(btns, "Yangi kod", self._new_code, kind="quiet").pack(side="left", padx=8)
+        self.owner_label = muted(f, "", size=9)
+        self.owner_label.pack(anchor="w", pady=(8, 0))
 
-        btns = tk.Frame(f, bg=BG)
-        btns.pack(fill="x", pady=10)
-        self._button(btns, "Kodni nusxalash", self._copy_code).pack(side="left")
-        self._button(btns, "Botni ochish", self._open_bot, primary=False).pack(side="left", padx=8)
-
-        tk.Label(f, text="ULANGAN TELEFONLAR", bg=BG, fg=MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(16, 6))
-        self.chats_box = tk.Listbox(
-            f, bg=CARD, fg=FG, borderwidth=0, highlightthickness=0,
-            selectbackground=ACCENT, font=("Segoe UI", 10), height=5,
-            activestyle="none",
-        )
-        self.chats_box.pack(fill="x")
-        self.chats_box.bind("<<ListboxSelect>>", self._on_chat_select)
-
-        # Capability is granted per phone, never inherited from being paired.
-        # The father's phone should stay on "find documents" forever.
-        self.caps_frame = tk.Frame(f, bg=CARD)
-        self.caps_frame.pack(fill="x", pady=(10, 0))
-        self.caps_title = tk.Label(
-            self.caps_frame, text="RUXSATLAR", bg=CARD, fg=MUTED,
-            font=("Segoe UI", 8, "bold"),
-        )
-        self.caps_title.pack(anchor="w", padx=12, pady=(10, 4))
-        self.cap_vars: dict[str, tk.BooleanVar] = {}
-        for cap in ALL_CAPS:
-            var = tk.BooleanVar(value=False)
-            self.cap_vars[cap] = var
-            tk.Checkbutton(
-                self.caps_frame, text=CAP_LABELS[cap], variable=var,
-                bg=CARD, fg=FG, selectcolor=BG, activebackground=CARD,
-                activeforeground=FG, font=("Segoe UI", 9), borderwidth=0,
-                highlightthickness=0, state="disabled",
-                command=lambda c=cap: self._toggle_cap(c),
-            ).pack(anchor="w", padx=12)
-        self.caps_hint = tk.Label(
-            self.caps_frame, text="Telefonni tanlang", bg=CARD, fg=MUTED,
-            font=("Segoe UI", 8),
-        )
-        self.caps_hint.pack(anchor="w", padx=12, pady=(2, 10))
-
-        self._button(f, "Tanlanganni o'chirish", self._revoke, primary=False).pack(anchor="w", pady=8)
-        self._refresh_chats()
+        label_title(f, "Kutilayotgan tasdiqlar")
+        self.approval_box = tk.Frame(f, bg=BG)
+        self.approval_box.pack(fill="x")
         return f
 
-    def _selected_chat(self) -> int | None:
-        sel = self.chats_box.curselection()
-        chats = self.cfg.chats
-        if not sel or sel[0] >= len(chats):
-            return None
-        return chats[sel[0]]
+    def _tab_policy(self) -> tk.Frame:
+        f = tk.Frame(self.notebook, bg=BG)
+        label_title(f, "Avtonomiya")
+        self.autonomy_var = tk.StringVar(value=normalize_autonomy(self.cfg.get("autonomy")))
+        for level in AUTONOMY_LEVELS:
+            row = tk.Frame(f, bg=CARD)
+            row.pack(fill="x", pady=3)
+            tk.Radiobutton(row, text=AUTONOMY_LABELS[level], variable=self.autonomy_var, value=level,
+                           command=self._set_autonomy, bg=CARD, fg=FG, selectcolor=BG,
+                           activebackground=CARD, activeforeground=FG, font=("Segoe UI Semibold", 9),
+                           borderwidth=0, highlightthickness=0, anchor="w").pack(anchor="w", padx=12, pady=(8, 0))
+            tk.Label(row, text=autonomy_explanation(level), bg=CARD, fg=MUTED, font=("Segoe UI", 8),
+                     wraplength=500, justify="left").pack(anchor="w", padx=34, pady=(0, 8))
 
-    def _on_chat_select(self, _event=None) -> None:
-        chat_id = self._selected_chat()
-        widgets = [w for w in self.caps_frame.winfo_children() if isinstance(w, tk.Checkbutton)]
-        self._caps_chat = chat_id
-        if chat_id is None:
-            for cap, var in self.cap_vars.items():
-                var.set(False)
-            for w in widgets:
-                w.configure(state="disabled")
-            self.caps_hint.configure(text="Telefonni tanlang")
-            return
-
-        current = self.cfg.caps(chat_id)
-        for cap, var in self.cap_vars.items():
-            var.set(cap in current)
-        for cap, w in zip(ALL_CAPS, widgets):
-            # FIND is what pairing means; it cannot be switched off separately.
-            w.configure(state="disabled" if cap == CAP_FIND else "normal")
-        self.caps_hint.configure(text=f"Telegram ID {chat_id}")
-
-    def _toggle_cap(self, _cap: str) -> None:
-        chat_id = self._selected_chat()
-        if chat_id is None:
-            return
-        if chat_id != self._caps_chat:
-            # The checkboxes still show a different chat's capabilities.
-            # Writing them now would silently widen the wrong phone's
-            # access - resync and make the user tick again.
-            self._on_chat_select()
-            self._log("Telefon almashdi — ruxsatlarni qaytadan belgilang.")
-            return
-        chosen = [c for c, v in self.cap_vars.items() if v.get()]
-        self.cfg.set_caps(chat_id, chosen)
-        self._log(f"{chat_id} ruxsatlari: {', '.join(self.cfg.caps(chat_id))}")
-
-    def _tab_settings(self, parent: ttk.Notebook) -> tk.Frame:
-        f = tk.Frame(parent, bg=BG)
-        canvas = tk.Canvas(f, bg=BG, highlightthickness=0)
-        body = tk.Frame(canvas, bg=BG)
-        canvas.pack(fill="both", expand=True)
-        canvas.create_window((0, 0), window=body, anchor="nw", width=470)
-        body.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
-
-        self.vars: dict[str, tk.Variable] = {}
-
-        self._field(body, "Server manzili", "server_url",
-                    "Render'dagi manzil, masalan https://coworker.onrender.com")
-
-        tk.Label(body, text="AI MODELI", bg=BG, fg=MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(16, 4))
-        row = tk.Frame(body, bg=BG)
-        row.pack(fill="x", pady=(0, 6))
-        self.provider = tk.StringVar(value="DeepSeek")
-        combo = ttk.Combobox(row, values=list(PROVIDERS), textvariable=self.provider,
-                             state="readonly", width=20)
-        combo.pack(side="left")
-        combo.bind("<<ComboboxSelected>>", self._apply_provider)
-        self.provider_hint = tk.Label(row, text=PROVIDERS["DeepSeek"]["hint"],
-                                      bg=BG, fg=MUTED, font=("Segoe UI", 8))
-        self.provider_hint.pack(side="left", padx=10)
-
-        self._field(body, "API kalit", "llm_api_key", "Provayder saytidan olinadi", secret=True)
-        self._field(body, "Model nomi", "llm_model", "")
-        self._field(body, "Server maxfiy kaliti", "relay_token",
-                    "Ixtiyoriy — serverdagi RELAY_TOKEN bilan bir xil bo'lishi kerak", secret=True)
-
-        tk.Label(body, text="QIDIRUV DOIRASI", bg=BG, fg=MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(16, 4))
-        tk.Label(body, text="Har qatorda bitta papka. Bo'sh qoldirilsa — barcha disklar.",
-                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w")
-        self.roots_box = tk.Text(body, height=4, bg=CARD, fg=FG, borderwidth=0,
-                                 insertbackground=FG, font=("Consolas", 9))
-        self.roots_box.pack(fill="x", pady=4)
-        self.roots_box.insert("1.0", "\n".join(self.cfg.get("roots", [])))
-
-        tk.Label(body, text="OVOZLI XABAR", bg=BG, fg=MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(16, 4))
-        self.stt_on = tk.BooleanVar(value=bool(self.cfg.get("stt_enabled", True)))
-        tk.Checkbutton(body, text="Yoqilgan", variable=self.stt_on, bg=BG, fg=FG,
-                       selectcolor=CARD, activebackground=BG, activeforeground=FG,
-                       font=("Segoe UI", 9), borderwidth=0,
-                       highlightthickness=0).pack(anchor="w")
-        srow = tk.Frame(body, bg=BG)
-        srow.pack(fill="x", pady=4)
-        self.stt_engine = tk.StringVar(value=self.cfg.get("stt_engine", "auto"))
-        ttk.Combobox(srow, values=["auto", "faster-whisper", "vosk", "off"],
-                     textvariable=self.stt_engine, state="readonly", width=16).pack(side="left")
-        self.stt_status = tk.Label(srow, text="", bg=BG, fg=MUTED, font=("Segoe UI", 8))
-        self.stt_status.pack(side="left", padx=10)
-
-        tk.Label(body, text="BRAUZER", bg=BG, fg=MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(16, 4))
-        tk.Label(body, text="Agent o'z Chrome oynasida ishlaydi (haqiqiy Chrome). "
-                 "Saytlarga bir marta kirasiz — sessiya saqlanadi.\n"
-                 "Kundalik Chrome'ingizga tegilmaydi.",
-                 bg=BG, fg=MUTED, font=("Segoe UI", 8), justify="left").pack(anchor="w")
-
-        tk.Label(body, text="ISHGA TUSHISH", bg=BG, fg=MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(16, 4))
-        self.autostart = tk.BooleanVar(value=tray_mod.autostart_enabled())
-        tk.Checkbutton(body, text="Kompyuter yonganda o'zi ishga tushsin",
-                       variable=self.autostart, bg=BG, fg=FG, selectcolor=CARD,
-                       activebackground=BG, activeforeground=FG,
-                       font=("Segoe UI", 9), borderwidth=0,
-                       highlightthickness=0).pack(anchor="w")
-        tk.Label(body, text="Oyna yopilsa ilova tray'da ishlashda davom etadi.",
-                 bg=BG, fg=MUTED, font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 0))
-
-        actions = tk.Frame(body, bg=BG)
-        actions.pack(fill="x", pady=18)
-        self._button(actions, "Saqlash", self._save).pack(side="left")
-        self._button(actions, "AI ni tekshirish", self._test_llm, primary=False).pack(side="left", padx=8)
+        label_title(f, "Bo'limlar")
+        muted(f, "Belgisi olib tashlangan bo'lim o'chiriladi. Har bir amal oldin tekshiriladi.").pack(anchor="w")
+        grid = tk.Frame(f, bg=BG)
+        grid.pack(fill="x", pady=(6, 0))
+        states = family_states(self.cfg.get("disabled_families", []) or [])
+        self.family_vars: dict[str, tk.BooleanVar] = {}
+        for index, name in enumerate(sorted(FAMILIES)):
+            var = tk.BooleanVar(value=states[name])
+            self.family_vars[name] = var
+            checkbox(grid, family_label(name), var, command=self._save_families).grid(
+                row=index // 2, column=index % 2, sticky="w", padx=(0, 16), pady=2)
         return f
 
-    def _tab_log(self, parent: ttk.Notebook) -> tk.Frame:
-        f = tk.Frame(parent, bg=BG)
-        self.log_box = tk.Text(f, bg=CARD, fg=MUTED, borderwidth=0, wrap="word",
-                               font=("Consolas", 9), insertbackground=FG)
-        self.log_box.pack(fill="both", expand=True, pady=12)
-        self.log_box.configure(state="disabled")
+    def _tab_audit(self) -> tk.Frame:
+        f = tk.Frame(self.notebook, bg=BG)
+        self._audit_tab = f
+        self.audit_box = tk.Text(f, bg=CARD, fg=MUTED, borderwidth=0, wrap="word", font=("Consolas", 9),
+                                 height=18, state="disabled")
+        self.audit_box.pack(fill="both", expand=True, pady=(12, 8))
+        row = tk.Frame(f, bg=BG)
+        row.pack(fill="x")
+        button(row, "Yangilash", self._refresh_audit, kind="quiet").pack(side="left")
+        button(row, "Zanjirni tekshirish", self._verify_audit).pack(side="left", padx=8)
+        self.audit_result = muted(f, "", size=9)
+        self.audit_result.pack(anchor="w", pady=(8, 0))
         return f
 
-    # --------------------------------------------------------------- widgets
+    def _tab_settings(self) -> tk.Frame:
+        self.settings = SettingsPanel(self.notebook, self.cfg)
+        return self.settings.frame
 
-    def _field(self, parent: tk.Widget, label: str, key: str, hint: str, secret: bool = False) -> None:
-        tk.Label(parent, text=label.upper(), bg=BG, fg=MUTED,
-                 font=("Segoe UI", 8, "bold")).pack(anchor="w", pady=(12, 4))
-        var = tk.StringVar(value=str(self.cfg.get(key, "")))
-        entry = tk.Entry(parent, textvariable=var, bg=CARD, fg=FG, borderwidth=0,
-                         insertbackground=FG, font=("Consolas", 10),
-                         show="•" if secret else "")
-        entry.pack(fill="x", ipady=6)
-        if hint:
-            tk.Label(parent, text=hint, bg=BG, fg=MUTED,
-                     font=("Segoe UI", 8)).pack(anchor="w", pady=(2, 0))
-        self.vars[key] = var
-
-    def _button(self, parent: tk.Widget, text: str, command, primary: bool = True) -> tk.Button:
-        return tk.Button(
-            parent, text=text, command=command,
-            bg=ACCENT if primary else CARD, fg="#0b0d12" if primary else FG,
-            activebackground=ACCENT if primary else CARD,
-            font=("Segoe UI Semibold", 9), borderwidth=0, padx=16, pady=7,
-            cursor="hand2",
-        )
+    def _tab_log(self) -> tk.Frame:
+        self.log_panel = LogPanel(self.notebook, self.log_handler)
+        return self.log_panel.frame
 
     # --------------------------------------------------------------- actions
 
-    def _apply_provider(self, _event=None) -> None:
-        preset = PROVIDERS.get(self.provider.get())
-        if not preset:
+    def _say(self, text: str) -> None:
+        self.note.configure(text=text)
+
+    def _set_autonomy(self) -> None:
+        level = normalize_autonomy(self.autonomy_var.get())
+        self.runtime.set_autonomy(level)
+        self._say(f"Avtonomiya saqlandi: {AUTONOMY_LABELS[level]}.")
+
+    def _save_families(self) -> None:
+        states = {name: var.get() for name, var in self.family_vars.items()}
+        previous = self.cfg.get("disabled_families", []) or []
+        self.cfg.set("disabled_families", disabled_from_states(states, previous))
+        self._say("Bo'limlar saqlandi.")
+
+    def _stop(self) -> None:
+        self.runtime.kill.stop()
+        self._say("To'xtatildi. Hozirgi ishlar bekor qilindi.")
+        self._refresh_live()
+
+    def _panic(self) -> None:
+        question = ("Hamma amallar darhol to'xtatiladi. Qayta yoqish faqat shu kompyuterdan mumkin. "
+                    "Davom etasizmi?")
+        if not messagebox.askyesno("PANIC", question, icon="warning", parent=self.root):
             return
-        self.vars["llm_model"].set(preset["model"])
-        self.cfg.set("llm_base_url", preset["base_url"])
-        self.provider_hint.configure(text=preset["hint"])
+        self.runtime.kill.panic()
+        self._say("PANIC yoqildi. Hamma amallar to'xtatildi.")
+        self._refresh_live()
 
-    def _save(self) -> None:
-        for key, var in self.vars.items():
-            self.cfg.set(key, var.get().strip())
-        roots = [r.strip() for r in self.roots_box.get("1.0", "end").splitlines() if r.strip()]
-        self.cfg.set("roots", roots)
-        self.cfg.set("stt_enabled", bool(self.stt_on.get()))
-        self.cfg.set("stt_engine", self.stt_engine.get())
-        self._log("Sozlamalar saqlandi. Ilovani qayta ishga tushiring.")
-        messagebox.showinfo("Coworker", "Saqlandi.\nO'zgarishlar uchun ilovani qayta oching.")
+    def _resume(self) -> None:
+        if not self._panic_on():
+            self._say("PANIC yoqilmagan edi.")
+            return
+        question = "PANIC o'chiriladi va agent yana ishlay boshlaydi. Davom etasizmi?"
+        if not messagebox.askyesno("Qayta yoqish", question, icon="question", parent=self.root):
+            return
+        resumed = self.runtime.resume_locally()
+        self._say("PANIC o'chirildi." if resumed else "PANIC o'chirilmadi.")
+        self._refresh_live()
 
-    def _test_llm(self) -> None:
-        self._save()
-        self._log("AI tekshirilmoqda...")
+    def _new_code(self) -> None:
+        # An explicit request from the desktop is the owner's own act, so it also clears
+        # a lockout left by wrong guesses. Telegram cannot do this.
+        self.runtime.pairing.clear_lockout()
+        self._issue_code()
+        self._say("Yangi kod tayyor. Eski kod endi ishlamaydi.")
 
-        def done(ok: bool, detail: str) -> None:
-            self._log(("AI javob berdi: " if ok else "AI xatosi: ") + detail)
-            (messagebox.showinfo if ok else messagebox.showerror)("Coworker", detail)
-
-        async def probe() -> None:
-            from .llm import LLM
-            client = LLM(self.cfg.get("llm_base_url"), self.cfg.get("llm_api_key"),
-                         self.cfg.get("llm_model"))
-            ok, detail = await client.ping()
-            await client.close()
-            self.root.after(0, lambda: done(ok, detail))
-
-        if self.loop:
-            asyncio.run_coroutine_threadsafe(probe(), self.loop)
+    def _issue_code(self) -> None:
+        self._code = self.runtime.pairing.issue_code()
+        self.code_label.configure(text=connect_command(self._code))
 
     def _copy_code(self) -> None:
+        if not self._code:
+            self._say("Kod hali tayyor emas. Bir oz kuting.")
+            return
         self.root.clipboard_clear()
-        self.root.clipboard_append(f"/connect {self.cfg.pair_code}")
-        self._log("Kod nusxalandi.")
+        self.root.clipboard_append(connect_command(self._code))
+        self._say("Nusxalandi. Telegram botiga yuboring.")
 
-    def _open_bot(self) -> None:
-        webbrowser.open("https://t.me/ulugcoworkerbot")
-
-    def _revoke(self) -> None:
-        selection = self.chats_box.curselection()
-        if not selection:
+    def _local_approve(self, approval: Any) -> None:
+        question = (f"{approval_text(approval)}\n\nBu amal ikki kanal orqali tasdiqlanadi. "
+                    "Mahalliy tasdiqdan keyin Telegram'da ham «Ha» bosilishi kerak. Davom etasizmi?")
+        if not messagebox.askyesno("Mahalliy tasdiq", question, parent=self.root):
             return
-        chat_id = self.cfg.chats[selection[0]]
-        self.cfg.revoke(chat_id)
-        self._refresh_chats()
-        if self.agent and self.loop:
-            asyncio.run_coroutine_threadsafe(self.agent.link.push_state(), self.loop)
-        self._log(f"{chat_id} o'chirildi.")
+        if self.runtime.approvals.local_approve(approval.id):
+            self._say("Mahalliy tasdiq berildi. Endi Telegram'da «Ha» bosing.")
+        else:
+            self._say("Tasdiq muddati tugagan yoki allaqachon yopilgan.")
+        self._approval_sig = None
+        self._refresh_approvals(self._owner())
 
-    def _refresh_chats(self) -> None:
-        self.chats_box.delete(0, "end")
-        for chat_id in self.cfg.chats:
-            self.chats_box.insert("end", f"  Telegram ID {chat_id}")
-        if not self.cfg.chats:
-            self.chats_box.insert("end", "  (hali hech kim ulanmagan)")
-        if hasattr(self, "caps_frame"):
-            self._on_chat_select()
+    def _on_tab(self, _event: Any = None) -> None:
+        if str(self.notebook.select()) == str(self._audit_tab):
+            self._refresh_audit()
 
-    # ---------------------------------------------------------------- events
+    def _refresh_audit(self) -> None:
+        rows = self.runtime.store.audit_tail(30)
+        text = "\n".join(format_audit_row(row) for row in rows) or "Hozircha amallar yo'q."
+        self.audit_box.configure(state="normal")
+        self.audit_box.delete("1.0", "end")
+        self.audit_box.insert("1.0", text)
+        self.audit_box.configure(state="disabled")
 
-    def push(self, state: str, detail: str) -> None:
-        """Thread-safe entry point used by the agent."""
-        self.events.put((state, detail))
+    def _verify_audit(self) -> None:
+        result = self.runtime.store.audit_verify()
+        self.audit_result.configure(text=verify_text(result), fg=OK if result[0] else BAD)
 
-    def _drain(self) -> None:
-        while True:
-            try:
-                state, detail = self.events.get_nowait()
-            except queue.Empty:
-                break
-            self._apply_state(state, detail)
-        self.root.after(120, self._drain)
+    # ------------------------------------------------------------- refresh
 
-    def _apply_state(self, state: str, detail: str) -> None:
-        if state == "note":
-            self._log(detail)
-            self._refresh_chats()
+    def _owner(self) -> Any:
+        return self.runtime.pairing.owner()
+
+    def _panic_on(self) -> bool:
+        return bool(self.runtime.kill.is_panic())
+
+    def _refresh_live(self) -> None:
+        self.panic_label.configure(text="PANIC YOQILGAN" if self._panic_on() else "")
+        owner = self._owner()
+        self.owner_label.configure(text=owner_line(owner))
+        self._refresh_approvals(owner)
+        self._show_status()
+
+    def _refresh_approvals(self, owner: Any) -> None:
+        items: list[Any] = []
+        if owner is not None:
+            items = unexpired(self.runtime.store.approvals_pending(owner[1]))
+        sig = (owner is not None, tuple((a.id, bool(a.local_ok)) for a in items))
+        if sig == self._approval_sig:
             return
-        if state == "paired":
-            self._refresh_chats()
+        self._approval_sig = sig
+        for child in self.approval_box.winfo_children():
+            child.destroy()
+        if owner is None:
+            muted(self.approval_box, "Telefon ulanmagan, shuning uchun tasdiqlar yo'q.").pack(anchor="w", pady=6)
+            return
+        if not items:
+            muted(self.approval_box, "Kutilayotgan tasdiq yo'q.").pack(anchor="w", pady=6)
+            return
+        for approval in items[:MAX_APPROVALS]:
+            self._approval_row(approval)
+        if len(items) > MAX_APPROVALS:
+            muted(self.approval_box, f"Yana {len(items) - MAX_APPROVALS} ta tasdiq bor.").pack(anchor="w")
 
-        colour, label = STATE_STYLE.get(state, (MUTED, state))
+    def _approval_row(self, approval: Any) -> None:
+        row = tk.Frame(self.approval_box, bg=CARD)
+        row.pack(fill="x", pady=3)
+        text = tk.Frame(row, bg=CARD)
+        text.pack(side="left", fill="x", expand=True, padx=12, pady=8)
+        tk.Label(text, text=approval_text(approval), bg=CARD, fg=FG, font=("Segoe UI", 9),
+                 wraplength=380, justify="left").pack(anchor="w")
+        tk.Label(text, text=approval_channel(approval), bg=CARD, fg=MUTED, font=("Segoe UI", 8),
+                 wraplength=380, justify="left").pack(anchor="w")
+        if approval.two_channel:
+            local = button(row, "Mahalliy tasdiq", lambda a=approval: self._local_approve(a))
+            if not needs_local_approval(approval):
+                local.configure(text="Mahalliy tasdiq berilgan", state="disabled")
+            local.pack(side="right", padx=10)
+
+    def _show_status(self) -> None:
+        colour, text = status_line(self._state, self._detail, panic=self._panic_on())
         self.dot.configure(fg=colour)
-        text = label
-        if state == "working" and detail:
-            text = f"{label}: {detail}"
-        elif state == "offline" and detail:
-            text = f"{label} — {detail}"
-        self.status_text.configure(text=text)
-        self.tray.update(state, text)
-        if state in ("offline", "connecting"):
-            self._log(f"{label}: {detail}")
+        self.status.configure(text=text)
+        self.tray.update(self._state, text)
 
-    def _log(self, message: str) -> None:
-        self.log_box.configure(state="normal")
-        self.log_box.insert("end", message.rstrip() + "\n")
-        self.log_box.see("end")
-        self.log_box.configure(state="disabled")
+    def _on_status(self, state: str, detail: str) -> None:
+        self._state, self._detail = state, detail
+        if state == "online" and not self._code_synced:
+            # The runtime has just issued its own pairing code, which is now stale.
+            # Issue one more so the code on screen is the one that works.
+            self._code_synced = True
+            self._issue_code()
+        self._show_status()
 
-    # ------------------------------------------------------------- lifecycle
+    def _tick(self) -> None:
+        try:
+            for kind, payload in self.bus.drain():
+                if kind == "status":
+                    self._on_status(*payload)
+                elif kind == "show":
+                    self._raise_window()
+            self.log_panel.pump()
+            self._ticks += 1
+            if self._ticks % LIVE_EVERY == 0:
+                self._refresh_live()
+        except Exception:
+            log.exception("the window could not refresh")
+        finally:
+            self.root.after(DRAIN_MS, self._tick)
+
+    # ----------------------------------------------------------- lifecycle
 
     def start(self) -> None:
-        threading.Thread(target=self._run_loop, daemon=True).start()
-        self.tray = tray_mod.Tray(self._show_window, self._quit)
+        """Start the tray, the runtime thread and the Tk main loop."""
+        tray_mod.sync_autostart(bool(self.cfg.get("autostart")))
         self.has_tray = self.tray.start()
         if not self.has_tray:
-            self._log("Tray ishlamadi — oyna yopilsa ilova to'xtaydi. "
-                      "Tuzatish: pip install pystray pillow")
-        # Ctrl+C that lands while Tk is running a callback gets swallowed -
-        # Tk prints "Exception in Tkinter callback" and carries on - so relying
-        # on KeyboardInterrupt alone can still leave a half-dead app. Handle
-        # the signal directly and quit for real.
+            log.warning("Tray ishlamadi — oyna yopilsa ilova to'xtaydi. Tuzatish: pip install pystray pillow")
+        threading.Thread(target=self._run_runtime, name="runtime", daemon=True).start()
+        # Ctrl+C that lands while Tk is busy can be swallowed by a Tk callback, so the
+        # signal is handled directly and the process quits for real.
         try:
-            signal.signal(signal.SIGINT, lambda *_: self._hard_exit())
+            signal.signal(signal.SIGINT, lambda *_: self.tray.quit())
         except (ValueError, OSError):
-            pass  # not the main thread, or no signal support
-
-        self.root.after(600, self._show_stt_status)
+            pass
         try:
             self.root.mainloop()
         finally:
-            # Ctrl+C in the launching terminal raises out of mainloop. Without
-            # the finally the exit path was skipped entirely, and the process
-            # lived on: interpreter shutdown had already disabled the default
-            # executor, yet the agent thread stayed connected and answered
-            # Telegram with "cannot schedule new futures after shutdown" for
-            # every message. Quitting has to be unconditional.
-            self._hard_exit()
+            self.tray.quit()
 
-    def _hard_exit(self) -> None:
-        """pystray runs its backend on non-daemon threads, so returning from
-        mainloop normally would leave this process alive and invisible - still
-        holding the WebSocket and answering Telegram after the user quit.
-        Give the agent a moment to close its socket, then exit for real."""
-        self.tray.stop()
-        deadline = time.monotonic() + 3.0
-        while time.monotonic() < deadline:
-            if self.agent is None or not self.agent.link.connected:
-                break
-            time.sleep(0.05)
-        os._exit(0)
-
-    def _run_loop(self) -> None:
-        self.loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(self.loop)
-        self.agent = CoworkerAgent(self.cfg, self.push)
+    def _run_runtime(self) -> None:
         try:
-            self.loop.run_until_complete(self.agent.run())
-        except Exception as exc:
-            self.push("offline", str(exc)[:120])
-
-    def _show_stt_status(self) -> None:
-        if self.agent:
-            self.stt_status.configure(text=self.agent.stt.status)
+            asyncio.run(self.runtime.run())
+        except Exception:
+            log.exception("the assistant stopped with an error")
+            self.bus.status("offline", "xato bilan to'xtadi")
 
     def _on_close(self) -> None:
-        """The X button hides to the tray - the agent must keep running."""
+        """The X button hides the window. The agent keeps running in the tray."""
         if not self.has_tray:
-            self._quit()
+            self.tray.quit()
             return
         self.root.withdraw()
         if not self._told_about_tray:
             self._told_about_tray = True
-            self.tray.notify(
-                "Coworker fonda ishlashda davom etmoqda. "
-                "Butunlay chiqish uchun tray belgisiga o'ng tugma bosing."
-            )
-
-    def _show_window(self) -> None:
-        """Called from the tray thread - bounce onto the Tk thread."""
-        self.root.after(0, self._raise_window)
+            self.tray.notify("Coworker fonda ishlashda davom etmoqda. "
+                             "Butunlay chiqish uchun tray belgisidan «Chiqish» ni tanlang.")
 
     def _raise_window(self) -> None:
         self.root.deiconify()
         self.root.lift()
         self.root.focus_force()
-
-    def _quit(self) -> None:
-        if self.agent and self.loop:
-            asyncio.run_coroutine_threadsafe(self.agent.stop(), self.loop)
-        self.tray.stop()
-        self.root.after(0, self.root.destroy)
-
-
-def main() -> None:
-    cfg = Config()
-    AgentWindow(cfg).start()

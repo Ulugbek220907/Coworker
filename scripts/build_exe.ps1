@@ -13,6 +13,9 @@ python -m pip install --quiet --upgrade pyinstaller
 python -m pip install --quiet -r agent\requirements.txt
 
 Write-Host "Building..." -ForegroundColor Cyan
+# keyring picks its Windows Credential Manager backend by name at run time, so
+# PyInstaller cannot see it on its own. psutil, pycaw and comtypes are reached
+# through imports that are made lazily and would otherwise be missed.
 python -m PyInstaller `
     --noconfirm --clean --onefile --windowed `
     --name Coworker `
@@ -20,8 +23,13 @@ python -m PyInstaller `
     --collect-submodules coworker `
     --hidden-import websockets `
     --hidden-import httpx `
+    --hidden-import keyring.backends.Windows `
+    --hidden-import psutil `
+    --hidden-import pycaw `
+    --hidden-import comtypes `
     --exclude-module matplotlib `
     --exclude-module notebook `
+    --exclude-module pytest `
     agent\run.py
 
 $exe = Join-Path $root "dist\Coworker.exe"
